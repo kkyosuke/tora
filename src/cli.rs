@@ -33,12 +33,15 @@ pub enum AwsCommands {
     Profiles,
     /// Log in through IAM Identity Center and open a shell with the selected profile
     Sso {
-        /// Profile name; omit to select interactively
+        /// Profile name; defaults to AWS_PROFILE / AWS_DEFAULT_PROFILE, otherwise a menu
         profile: Option<String>,
-        /// Print a Bash/Zsh export statement after successful login
+        /// Select a profile interactively, ignoring the current environment
+        #[arg(long, conflicts_with = "profile")]
+        select: bool,
+        /// Print a Bash/Zsh export statement after authentication succeeds
         #[arg(long = "export", conflicts_with = "no_shell")]
         export: bool,
-        /// Log in without opening an authenticated shell
+        /// Ensure authentication without opening a shell
         #[arg(long)]
         no_shell: bool,
         /// Do not automatically open the browser

@@ -31,6 +31,14 @@ if [ "$1" = configure ]; then
   printf '%s' "$PROFILES"
   exit "${LIST_STATUS:-0}"
 fi
+if [ "$1" = sts ]; then
+  if [ -n "$AWS_ACCESS_KEY_ID$AWS_SECRET_ACCESS_KEY$AWS_SESSION_TOKEN$AWS_SECURITY_TOKEN$AWS_DEFAULT_PROFILE" ]; then
+    printf 'credential environment was not cleared\n' >&2
+    exit 9
+  fi
+  printf '%s\n' "${CHECK_ERROR-Error when retrieving token from sso: Token has expired and refresh failed}" >&2
+  exit "${CHECK_STATUS:-1}"
+fi
 printf 'login output: $(touch injected)\n'
 printf 'login profile: %s\n' "$AWS_PROFILE" >&2
 exit "${LOGIN_STATUS:-0}"
@@ -61,14 +69,16 @@ exit "${SHELL_STATUS:-0}"
             .env("SHELL", self.0.join("shell"))
             .env("CALLS", self.0.join("calls"))
             .env("PROFILES", "default\ndev\ndefault\n")
-            .env("AWS_PROFILE", "previous")
+            .env_remove("AWS_PROFILE")
             .env("AWS_CONFIG_FILE", self.0.join("config"))
             .env("AWS_SHARED_CREDENTIALS_FILE", self.0.join("credentials"))
             .env("AWS_ACCESS_KEY_ID", "old-key")
             .env("AWS_SECRET_ACCESS_KEY", "old-secret")
             .env("AWS_SESSION_TOKEN", "old-token")
             .env("AWS_SECURITY_TOKEN", "old-token")
-            .env("AWS_DEFAULT_PROFILE", "old-default")
+            .env_remove("AWS_DEFAULT_PROFILE")
+            .env_remove("CHECK_STATUS")
+            .env_remove("CHECK_ERROR")
             .env_remove("LIST_STATUS")
             .env_remove("LOGIN_STATUS")
             .env_remove("SHELL_STATUS");
@@ -134,7 +144,7 @@ fn explicit_profile_skips_discovery_and_opens_authenticated_shell() {
     )));
     assert_eq!(
         f.calls(),
-        "sso\nlogin\n--profile\ncustom\n--no-browser\n--use-device-code\n"
+        "sts\nget-caller-identity\n--profile\ncustom\nsso\nlogin\n--profile\ncustom\n--no-browser\n--use-device-code\n"
     );
 }
 
@@ -268,4 +278,130 @@ fn export_and_no_shell_are_mutually_exclusive() {
             .success()
     );
     assert!(f.calls().is_empty());
+}
+
+#[test]
+fn valid_credentials_skip_login_in_all_output_modes() {
+    for mode in [None, Some("--export"), Some("--no-shell")] {
+        let f = Fixture::new();
+        let mut args = vec!["sso", "dev"];
+        args.extend(mode);
+        let output = f.command(&args).env("CHECK_STATUS", "0").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(f.calls(), "sts\nget-caller-identity\n--profile\ndev\n");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match mode {
+            None => assert!(stdout.contains("shell:-i:dev")),
+            Some("--export") => assert!(stdout.contains("export AWS_PROFILE='dev'")),
+            _ => assert!(stdout.is_empty()),
+        }
+    }
+}
+
+#[test]
+fn current_profile_is_reused_and_explicit_profile_wins() {
+    for (args, expected) in [
+        (vec!["sso"], "current"),
+        (vec!["sso", "explicit"], "explicit"),
+    ] {
+        let f = Fixture::new();
+        let output = f
+            .command(&args)
+            .env("AWS_PROFILE", "current")
+            .env("AWS_DEFAULT_PROFILE", "fallback")
+            .env("CHECK_STATUS", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            f.calls(),
+            format!("sts\nget-caller-identity\n--profile\n{expected}\n")
+        );
+    }
+    let f = Fixture::new();
+    let output = f
+        .command(&["sso"])
+        .env("AWS_PROFILE", "")
+        .env("AWS_DEFAULT_PROFILE", "fallback")
+        .env("CHECK_STATUS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shell:-i:fallback"));
+}
+
+#[test]
+fn select_ignores_current_profile() {
+    let f = Fixture::new();
+    let mut child = f
+        .command(&["sso", "--select"])
+        .env("AWS_PROFILE", "current")
+        .env("AWS_DEFAULT_PROFILE", "fallback")
+        .env("CHECK_STATUS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"2\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shell:-i:dev"));
+    assert!(f.calls().starts_with("configure\nlist-profiles\n"));
+}
+
+#[test]
+fn select_conflicts_with_explicit_profile() {
+    let f = Fixture::new();
+    assert!(
+        !f.command(&["sso", "dev", "--select"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn missing_and_expired_sso_credentials_trigger_login() {
+    for error in [
+        "Error loading SSO Token: Token for session does not exist",
+        "The SSO session associated with this profile has expired or is otherwise invalid.",
+        "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation",
+        "An error occurred (UnauthorizedException) when calling the GetRoleCredentials operation",
+    ] {
+        let f = Fixture::new();
+        let output = f
+            .command(&["sso", "dev"])
+            .env("CHECK_ERROR", error)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(f.calls().contains("sso\nlogin\n"));
+    }
+}
+
+#[test]
+fn unrelated_check_errors_do_not_login_or_export() {
+    for error in [
+        "Could not connect to the endpoint URL",
+        "The config profile (dev) could not be found",
+        "An error occurred (AccessDenied) when calling the AssumeRole operation",
+    ] {
+        for extra in [None, Some("--export")] {
+            let f = Fixture::new();
+            let mut args = vec!["sso", "dev"];
+            args.extend(extra);
+            let output = f.command(&args).env("CHECK_ERROR", error).output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains(error));
+            assert_eq!(f.calls(), "sts\nget-caller-identity\n--profile\ndev\n");
+        }
+    }
 }

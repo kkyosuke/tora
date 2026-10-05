@@ -61,7 +61,8 @@ AWS CLI v2 を PATH に配置し、`aws configure sso` でプロファイルを�
 
 ```sh
 tora aws profiles                  # 設定済みプロファイルの一覧
-tora aws sso                       # 矢印キーで選択 → SSO ログイン → 認証用シェル
+tora aws sso                       # 現在のプロファイルで認証確認 → 必要ならログイン → シェル
+tora aws sso --select              # プロファイルを選び直して認証用シェルへ
 tora aws sso dev                   # プロファイルを指定して認証用シェルへ
 aws sts get-caller-identity        # シェル内で認証先を確認
 exit                              # 元のシェルに戻る
@@ -70,14 +71,21 @@ exit                              # 元のシェルに戻る
 `dialoguer` による選択メニューは Enter で確定、Esc / q でキャンセルできます。
 「Type a custom profile」で手入力でき、プロファイルがない場合も手入力できます。
 標準入力がターミナルでない場合は番号選択になります（0 で手入力）。
-プロファイルを引数に指定すると一覧取得・選択を省略します。
+プロファイルは引数、空でない `AWS_PROFILE`、空でない `AWS_DEFAULT_PROFILE` の順で決定し、
+いずれもなければ選択メニューを表示します。`--select` は環境変数を無視して
+選択メニューを表示します（プロファイル引数との併用は不可）。
+選択結果は子シェルに反映し、前回選択の永続保存は行いません。
 
 一覧取得には `aws configure list-profiles` を使うため、`~/.aws/config`、
 `~/.aws/credentials` のほか `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` も
-AWS CLI のルールに従って扱います。SSO ログインは `aws sso login --profile ...` を実行します。
+AWS CLI のルールに従って扱います。認証確認には `aws sts get-caller-identity --profile ...` を使い、
+成功すればブラウザーを開かずに進みます。AWS CLI が更新可能な認証情報は自動更新します。
+未ログイン・期限切れなど既知の認証エラーの場合だけ、
+`aws sso login --profile ...` を実行します。通信障害・設定不備など、
+その他のエラーは表示して停止します。確認・ログイン時も後述の競合する環境変数を外します。
 [詳細は AWS 公式ドキュメント](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)。
 
-ログイン成功後、現在のターミナルで `$SHELL -i`（未設定なら `/bin/sh -i`）を起動し、
+認証確認またはログイン成功後、現在のターミナルで `$SHELL -i`（未設定なら `/bin/sh -i`）を起動し、
 `AWS_PROFILE` を設定します。選択したプロファイルより優先される既存の
 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_SESSION_TOKEN`、
 `AWS_SECURITY_TOKEN`、`AWS_DEFAULT_PROFILE` は子シェルから外します。
@@ -86,14 +94,14 @@ Zsh / Bash では、プロンプトの先頭に黄色の `[aws:プロファイ�
 それ以外のシェルではプロファイル設定のみ行います。
 元のシェルの環境は変わりません。シェル設定ファイルで AWS 環境変数を再設定している場合は、
 その設定が優先されるので `aws sts get-caller-identity` で確認してください。
-認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は再ログインしてください。
+認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は `tora aws sso` を再実行してください。
 
 ```sh
-tora aws sso dev --no-shell                         # ログインだけ実行
+tora aws sso dev --no-shell                         # 認証確認・必要なログインのみ実行
 tora aws sso dev --no-browser --use-device-code      # 別デバイスのブラウザーで認証
 ```
 
-現在の Bash / Zsh 自体に反映する場合は、ログイン成功時のみ出力するシェル文を評価できます。
+現在の Bash / Zsh 自体に反映する場合は、認証成功時のみ出力するシェル文を評価できます。
 認証メッセージ・選択メニューは標準エラーに出力します。
 
 ```sh
