@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
+        Commands::Aws { command } => aws::run(command),
         Commands::Update { version } => update::run(version.as_deref()),
         Commands::Completion { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "tora", &mut std::io::stdout());
@@ -21,3 +22,4 @@ fn main() -> ExitCode {
         }
     }
 }
+mod aws;
