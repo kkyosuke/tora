@@ -37,34 +37,47 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
         }
         AwsCommands::Sso {
             profile,
+            select,
             export,
             no_shell,
             no_browser,
             use_device_code,
         } => {
+            let profile = profile.or_else(|| {
+                if select {
+                    None
+                } else {
+                    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
+                        .into_iter()
+                        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+                }
+            });
             let profile = resolve_profile(profile)?;
-            eprintln!("Logging in with AWS profile {profile:?}...");
-            let mut command = aws();
-            command.args(["sso", "login", "--profile", &profile]);
-            command.env("AWS_PROFILE", &profile);
-            if no_browser {
-                command.arg("--no-browser");
-            }
-            if use_device_code {
-                command.arg("--use-device-code");
-            }
-            // Preserve browser/device login interaction while keeping stdout safe to eval.
-            let status = command
-                .stdout(Stdio::from(io::stderr()))
-                .status()
-                .map_err(aws_error)?;
-            if !status.success() {
-                return Err(io::Error::other(format!(
-                    "aws sso login failed for profile {profile:?}: {status}"
-                )));
+            if credentials_valid(&profile)? {
+                eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
+            } else {
+                eprintln!("Logging in with AWS profile {profile:?}...");
+                let mut command = profile_command(&profile);
+                command.args(["sso", "login", "--profile", &profile]);
+                if no_browser {
+                    command.arg("--no-browser");
+                }
+                if use_device_code {
+                    command.arg("--use-device-code");
+                }
+                // Preserve browser/device login interaction while keeping stdout safe to eval.
+                let status = command
+                    .stdout(Stdio::from(io::stderr()))
+                    .status()
+                    .map_err(aws_error)?;
+                if !status.success() {
+                    return Err(io::Error::other(format!(
+                        "aws sso login failed for profile {profile:?}: {status}"
+                    )));
+                }
+                eprintln!("SSO login completed for profile {profile:?}.");
             }
             history::remember(&profile);
-            eprintln!("SSO login completed for profile {profile:?}.");
             if export {
                 writeln!(io::stdout().lock(), "{}", export_statement(&profile))?;
             } else if no_shell {
@@ -79,7 +92,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
 }
 
 // Static credentials take precedence over AWS_PROFILE. Remove them only in the
-// new shell (or in explicitly requested export output), never in the parent process.
+// child processes (or explicitly requested export output), never in the parent process.
 const CREDENTIAL_ENV: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -87,6 +100,45 @@ const CREDENTIAL_ENV: &[&str] = &[
     "AWS_SECURITY_TOKEN",
     "AWS_DEFAULT_PROFILE",
 ];
+
+// Use the same credential environment for validation, login and the child shell.
+fn profile_command(profile: &str) -> Command {
+    let mut command = aws();
+    configure_profile(&mut command, profile);
+    command
+}
+
+fn credentials_valid(profile: &str) -> io::Result<bool> {
+    let output = profile_command(profile)
+        .args(["sts", "get-caller-identity", "--profile", profile])
+        .stdout(Stdio::null())
+        .output()
+        .map_err(aws_error)?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    // AWS CLI does not expose structured errors for local SSO cache failures.
+    // Only known missing/expired authentication errors should trigger a browser.
+    let message = error.to_ascii_lowercase();
+    if message.contains("token has expired and refresh failed")
+        || message.contains(
+            "sso session associated with this profile has expired or is otherwise invalid",
+        )
+        || (message.contains("error loading sso token") && message.contains("does not exist"))
+        || message.contains("(expiredtoken)")
+        || message.contains("(expiredtokenexception)")
+        || message.contains("(invalidgrantexception)")
+        || (message.contains("(unauthorizedexception)") && message.contains("getrolecredentials"))
+    {
+        return Ok(false);
+    }
+    Err(io::Error::other(format!(
+        "AWS authentication check failed for profile {profile:?}: {}\n{}",
+        output.status,
+        error.trim()
+    )))
+}
 
 fn open_shell(profile: &str) -> io::Result<()> {
     let shell = std::env::var_os("SHELL")
