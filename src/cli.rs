@@ -29,6 +29,14 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum AwsCommands {
+    /// Run a command with a profile's existing credentials (does not log in)
+    Exec {
+        /// Profile name; omit to select interactively
+        profile: Option<String>,
+        /// Command and arguments, after -- (executed without a shell)
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// List configured profiles using AWS CLI's configuration resolution
     Profiles,
     /// Log in through IAM Identity Center and open a shell with the selected profile
