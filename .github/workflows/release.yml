@@ -5,7 +5,10 @@ on:
 permissions:
   contents: read
 jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -22,16 +25,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: rustup toolchain install stable --profile minimal
       - name: Validate release tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python3 scripts/check-release.py
-      - run: cargo +stable fmt --check
-      - run: cargo +stable clippy --locked --all-targets -- -D warnings
-      - run: cargo +stable test --locked
-      - run: cargo +stable build --locked
-      - run: python3 -m unittest discover -s scripts/tests -v
       - run: rustup target add --toolchain stable ${{ matrix.target }}
       - run: cargo +stable build --locked --release --target ${{ matrix.target }}
       - name: Package binary and verification files
