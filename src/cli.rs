@@ -20,11 +20,43 @@ pub enum Commands {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
-    /// Generate a shell completion script
+    /// Generate or install shell completion
     Completion {
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
+        #[command(subcommand)]
+        command: CompletionCommand,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CompletionCommand {
+    /// Generate Bash completion
+    Bash,
+    /// Generate Zsh completion
+    Zsh,
+    /// Generate Fish completion
+    Fish,
+    /// Generate PowerShell completion
+    Powershell,
+    /// Generate Elvish completion
+    Elvish,
+    /// Install completion and its shell startup configuration
+    Install {
+        /// Override shell detection
+        #[arg(long, value_enum)]
+        shell: Option<InstallShell>,
+        /// Completion loader file (default: $TORA_HOME/completions/<shell>)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Accept the displayed changes without prompting (requires --shell)
+        #[arg(long, requires = "shell")]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallShell {
+    Bash,
+    Zsh,
 }
 
 #[derive(Subcommand)]
