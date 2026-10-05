@@ -27,7 +27,7 @@ class AwsTerminalTests(unittest.TestCase):
             shell = root / "shell"
             shell.write_text('#!/bin/sh\nprintf "AUTHENTICATED-SHELL:%s\\n" "$AWS_PROFILE"\n')
             shell.chmod(0o755)
-            env = dict(os.environ, PATH=str(root), SHELL=str(shell), TERM="xterm-256color")
+            env = dict(os.environ, PATH=str(root), SHELL=str(shell), TORA_HOME=str(root / "tora"), TERM="xterm-256color")
             master, slave = pty.openpty()
             try:
                 process = subprocess.Popen([BINARY, "aws", "sso"], env=env,
@@ -35,7 +35,9 @@ class AwsTerminalTests(unittest.TestCase):
                 os.close(slave)
                 slave = None
                 output = bytearray()
-                sent = False
+                steps = ([(b"Type a custom profile", keys)]
+                         if isinstance(keys, bytes) else list(keys))
+                step = 0
                 deadline = time.monotonic() + 10
                 try:
                     while time.monotonic() < deadline:
@@ -49,12 +51,12 @@ class AwsTerminalTests(unittest.TestCase):
                             if not data:
                                 break
                             output.extend(data)
-                            if not sent and b"Type a custom profile" in output:
-                                os.write(master, keys)
-                                sent = True
+                            if step < len(steps) and steps[step][0] in output:
+                                os.write(master, steps[step][1])
+                                step += 1
                         if process.poll() is not None and not select.select([master], [], [], 0)[0]:
                             break
-                    self.assertTrue(sent, output.decode(errors="replace"))
+                    self.assertEqual(step, len(steps), output.decode(errors="replace"))
                     result = process.wait(timeout=2)
                 finally:
                     if process.poll() is None:
@@ -74,6 +76,26 @@ class AwsTerminalTests(unittest.TestCase):
 
     def test_cancel_does_not_login_or_start_shell(self):
         status, output = self.run_terminal(b"q")
+        self.assertNotEqual(status, 0, output)
+        self.assertNotIn("LOGIN:", output)
+        self.assertNotIn("AUTHENTICATED-SHELL:", output)
+
+    def test_search_filters_profiles(self):
+        status, output = self.run_terminal([
+            (b"Type a custom profile", b"\x1b[B\x1b[B\x1b[B\r"),
+            (b"Search profile name", b"DEV\r"),
+            (b"DEV", b"\r"),
+        ])
+        self.assertEqual(status, 0, output)
+        self.assertIn("LOGIN:dev", output)
+        self.assertIn("AUTHENTICATED-SHELL:dev", output)
+
+    def test_search_without_matches_can_cancel(self):
+        status, output = self.run_terminal([
+            (b"Type a custom profile", b"\x1b[B\x1b[B\x1b[B\r"),
+            (b"Search profile name", b"missing\r"),
+            (b"No matching profiles", b"q"),
+        ])
         self.assertNotEqual(status, 0, output)
         self.assertNotIn("LOGIN:", output)
         self.assertNotIn("AUTHENTICATED-SHELL:", output)

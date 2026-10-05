@@ -42,7 +42,7 @@ class ShellBadgeTests(unittest.TestCase):
             (root / ".bashrc").write_text(bashrc)
             profile = "dev'$(touch injected)%F{red}`touch injected`\\u!"
             env = dict(os.environ, HOME=str(root), ZDOTDIR=str(config),
-                       SHELL=shell, TMPDIR=str(root), PATH=f"{root}:{os.environ['PATH']}",
+                       SHELL=shell, TORA_HOME=str(root / "tora"), TMPDIR=str(root), PATH=f"{root}:{os.environ['PATH']}",
                        TERM="xterm-256color")
             master, slave = pty.openpty()
             try:
