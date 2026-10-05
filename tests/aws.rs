@@ -58,6 +58,7 @@ exit "${SHELL_STATUS:-0}"
             .args(args)
             .current_dir(&self.0)
             .env("PATH", &self.0)
+            .env("TORA_HOME", self.0.join("tora"))
             .env("SHELL", self.0.join("shell"))
             .env("CALLS", self.0.join("calls"))
             .env("PROFILES", "default\ndev\ndefault\n")
@@ -268,4 +269,228 @@ fn export_and_no_shell_are_mutually_exclusive() {
             .success()
     );
     assert!(f.calls().is_empty());
+}
+
+#[test]
+fn exec_sets_profile_clears_credentials_and_preserves_exit_status() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["exec", "dev", "--", "shell", "child-argument"])
+        .env("SHELL_STATUS", "23")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(out.contains("shell:child-argument:dev"));
+    assert!(out.contains("credentials:unset:unset:unset:unset:unset"));
+    assert!(out.contains(&format!(
+        "config:{}:{}",
+        f.0.join("config").display(),
+        f.0.join("credentials").display()
+    )));
+    assert!(
+        f.calls().is_empty(),
+        "exec must not discover or log in for an explicit profile"
+    );
+}
+
+#[test]
+fn exec_passes_arguments_literally_and_inherits_streams() {
+    let f = Fixture::new();
+    f.script("child", "#!/bin/sh\nprintf '%s\\n' \"$@\"\nIFS= read -r line\nprintf 'input:%s\\n' \"$line\"\nprintf 'child stderr\\n' >&2\n");
+    let output = f.input(
+        &[
+            "exec",
+            "dev",
+            "--",
+            "child",
+            "--help",
+            "a b",
+            "",
+            "$(touch injected); `touch injected`",
+        ],
+        "hello\n",
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "--help\na b\n\n$(touch injected); `touch injected`\ninput:hello\n"
+    );
+    assert_eq!(output.stderr, b"child stderr\n");
+    assert!(!f.0.join("injected").exists());
+}
+
+#[test]
+fn exec_preserves_signal_termination() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let output = f
+        .command(&["exec", "dev", "--", "/bin/sh", "-c", "kill -TERM $$"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(15));
+}
+
+#[test]
+fn exec_requires_command_and_valid_profile() {
+    for args in [
+        vec!["exec", "dev"],
+        vec!["exec", "dev", "--"],
+        vec!["exec", "", "--", "shell"],
+        vec!["exec", "bad\nprofile", "--", "shell"],
+    ] {
+        let f = Fixture::new();
+        let output = f.command(&args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(f.calls().is_empty());
+        assert!(!f.0.join("tora/aws-profile-history").exists());
+    }
+}
+
+#[test]
+fn exec_missing_program_reports_failure() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["exec", "dev", "--", "missing-program"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stderr.is_empty());
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn exec_can_select_search_or_cancel_without_logging_in() {
+    let f = Fixture::new();
+    let output = f.input(&["exec", "--", "shell", "arg"], "/DEV\n1\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shell:arg:dev"));
+    assert_eq!(f.calls(), "configure\nlist-profiles\n");
+    let f = Fixture::new();
+    let output = f.input(&["exec", "--", "shell"], "q\n");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!f.0.join("tora/aws-profile-history").exists());
+}
+
+#[test]
+fn history_is_shared_deduplicated_and_does_not_change_profiles_output() {
+    let f = Fixture::new();
+    assert!(
+        f.command(&["sso", "dev", "--no-shell"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let output = f.input(&["exec", "--", "shell", "arg"], "1\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shell:arg:dev"));
+    assert!(
+        f.command(&["exec", "default", "--", "shell"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let history = f.0.join("tora/aws-profile-history");
+    assert_eq!(fs::read_to_string(&history).unwrap(), "default\ndev\n");
+    assert_eq!(
+        fs::metadata(history).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        f.command(&["profiles"]).output().unwrap().stdout,
+        b"default\ndev\n"
+    );
+    let output = f.input(&["sso", "--export"], "1\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='default'"));
+}
+
+#[test]
+fn failed_login_does_not_change_history() {
+    let f = Fixture::new();
+    assert!(
+        f.command(&["sso", "dev", "--no-shell"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let output = f
+        .command(&["sso", "default", "--export"])
+        .env("LOGIN_STATUS", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-profile-history")).unwrap(),
+        "dev\n"
+    );
+}
+
+#[test]
+fn corrupt_and_stale_history_do_not_break_selection() {
+    for content in [
+        b"\xff\xfe".as_slice(),
+        b"deleted\n\x1b[2J\ndev\ndev\n",
+        b"\n",
+    ] {
+        let f = Fixture::new();
+        fs::create_dir(f.0.join("tora")).unwrap();
+        fs::write(f.0.join("tora/aws-profile-history"), content).unwrap();
+        let output = f.input(&["sso", "--export"], "/dev\n1\n");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='dev'"));
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(!err.contains("deleted"));
+        assert!(!err.contains("\x1b[2J"));
+    }
+}
+
+#[test]
+fn history_is_bounded_and_save_failure_is_nonfatal() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    let history = f.0.join("tora/aws-profile-history");
+    fs::write(
+        &history,
+        (0..20)
+            .map(|i| format!("profile-{i}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    assert!(
+        f.command(&["sso", "dev", "--no-shell"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let saved = fs::read_to_string(&history).unwrap();
+    assert_eq!(saved.lines().count(), 20);
+    assert!(saved.starts_with("dev\nprofile-0\n"));
+    assert!(!saved.contains("profile-19\n"));
+    fs::remove_file(&history).unwrap();
+    fs::create_dir(&history).unwrap();
+    let output = f.command(&["sso", "dev", "--export"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='dev'"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not save"));
+}
+
+#[test]
+fn search_with_no_matches_can_reset_or_enter_custom_profile() {
+    let f = Fixture::new();
+    let output = f.input(&["sso", "--export"], "/missing\n1\n/\n2\n");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='dev'"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No matching profiles"));
+    let output = f.input(&["sso", "--export"], "/missing\n0\ncustom\n");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='custom'"));
 }

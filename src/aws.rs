@@ -1,3 +1,5 @@
+mod history;
+
 use crate::cli::AwsCommands;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::{
@@ -8,6 +10,23 @@ use std::{
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
     match command {
+        AwsCommands::Exec { profile, command } => {
+            let profile = resolve_profile(profile)?;
+            let mut child = Command::new(&command[0]);
+            child.args(&command[1..]);
+            configure_profile(&mut child, &profile);
+            history::remember(&profile);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                Err(child.exec())
+            }
+            #[cfg(not(unix))]
+            {
+                let status = child.status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         AwsCommands::Profiles => {
             let profiles = profiles()?;
             let mut out = io::stdout().lock();
@@ -23,18 +42,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             no_browser,
             use_device_code,
         } => {
-            let profile = match profile {
-                Some(profile) => profile,
-                None if io::stdin().is_terminal() && io::stderr().is_terminal() => {
-                    select_terminal_profile(&profiles()?)?
-                }
-                None => select_profile(
-                    &profiles()?,
-                    &mut io::stdin().lock(),
-                    &mut io::stderr().lock(),
-                )?,
-            };
-            validate_profile(&profile)?;
+            let profile = resolve_profile(profile)?;
             eprintln!("Logging in with AWS profile {profile:?}...");
             let mut command = aws();
             command.args(["sso", "login", "--profile", &profile]);
@@ -55,6 +63,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
                     "aws sso login failed for profile {profile:?}: {status}"
                 )));
             }
+            history::remember(&profile);
             eprintln!("SSO login completed for profile {profile:?}.");
             if export {
                 writeln!(io::stdout().lock(), "{}", export_statement(&profile))?;
@@ -85,10 +94,8 @@ fn open_shell(profile: &str) -> io::Result<()> {
         .unwrap_or_else(|| "/bin/sh".into());
     let mut command = Command::new(&shell);
     let _startup = crate::shell::configure(&mut command, &shell)?;
-    command.arg("-i").env("AWS_PROFILE", profile);
-    for name in CREDENTIAL_ENV {
-        command.env_remove(name);
-    }
+    command.arg("-i");
+    configure_profile(&mut command, profile);
     eprintln!("Opening shell with AWS_PROFILE={profile:?}. Type exit to return.");
     #[cfg(unix)]
     {
@@ -107,11 +114,46 @@ fn open_shell(profile: &str) -> io::Result<()> {
     }
 }
 
+fn configure_profile(command: &mut Command, profile: &str) {
+    command.env("AWS_PROFILE", profile);
+    for name in CREDENTIAL_ENV {
+        command.env_remove(name);
+    }
+}
+
+fn resolve_profile(profile: Option<String>) -> io::Result<String> {
+    let profile = match profile {
+        Some(profile) => profile,
+        None => {
+            let mut profiles = profiles()?;
+            history::sort(&mut profiles);
+            if io::stdin().is_terminal() && io::stderr().is_terminal() {
+                select_terminal_profile(&profiles)?
+            } else {
+                select_profile(&profiles, &mut io::stdin().lock(), &mut io::stderr().lock())?
+            }
+        }
+    };
+    validate_profile(&profile)?;
+    Ok(profile)
+}
+
+fn filtered_profiles(profiles: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    profiles
+        .iter()
+        .filter(|p| p.to_lowercase().contains(&query))
+        .cloned()
+        .collect()
+}
+
 fn select_terminal_profile(profiles: &[String]) -> io::Result<String> {
     let theme = ColorfulTheme::default();
-    if !profiles.is_empty() {
-        let mut items = profiles.to_vec();
+    let mut visible = profiles.to_vec();
+    while !profiles.is_empty() {
+        let mut items = visible.clone();
         items.push("Type a custom profile".into());
+        items.push("Search profiles".into());
         let selection = Select::with_theme(&theme)
             .with_prompt("AWS profile (Esc/q to cancel)")
             .items(&items)
@@ -119,8 +161,20 @@ fn select_terminal_profile(profiles: &[String]) -> io::Result<String> {
             .interact_opt()
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("profile selection cancelled"))?;
-        if selection < profiles.len() {
-            return Ok(profiles[selection].clone());
+        if selection < visible.len() {
+            return Ok(visible[selection].clone());
+        }
+        if selection == visible.len() {
+            break;
+        }
+        let query: String = Input::with_theme(&theme)
+            .with_prompt("Search profile name (empty to show all)")
+            .allow_empty(true)
+            .interact_text()
+            .map_err(io::Error::other)?;
+        visible = filtered_profiles(profiles, &query);
+        if visible.is_empty() {
+            eprintln!("No matching profiles. Search again or enter a custom profile.");
         }
     }
     Input::<String>::with_theme(&theme)
@@ -206,29 +260,40 @@ fn select_profile(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> io::Result<String> {
-    if profiles.is_empty() {
-        writeln!(
-            output,
-            "No AWS profiles found. Enter a custom profile name."
-        )?;
-    } else {
-        writeln!(output, "Select AWS profile:")?;
-        for (index, profile) in profiles.iter().enumerate() {
-            writeln!(output, "  {}. {profile}", index + 1)?;
-        }
-        writeln!(output, "  0. Type a custom profile")?;
-    }
+    let mut visible = profiles.to_vec();
     loop {
+        if profiles.is_empty() {
+            writeln!(
+                output,
+                "No AWS profiles found. Enter a custom profile name."
+            )?;
+        } else {
+            writeln!(output, "Select AWS profile:")?;
+            for (index, profile) in visible.iter().enumerate() {
+                writeln!(output, "  {}. {profile}", index + 1)?;
+            }
+            writeln!(output, "  0. Type a custom profile")?;
+        }
         if !profiles.is_empty() {
-            write!(output, "Enter number (0 for custom, q to cancel): ")?;
+            write!(
+                output,
+                "Enter number (0 for custom, /text to search, / to reset, q to cancel): "
+            )?;
             output.flush()?;
             let selection = read_line(input)?;
             if selection == "q" {
                 return Err(io::Error::other("profile selection cancelled"));
             }
+            if let Some(query) = selection.strip_prefix('/') {
+                visible = filtered_profiles(profiles, query);
+                if visible.is_empty() {
+                    writeln!(output, "No matching profiles.")?;
+                }
+                continue;
+            }
             match selection.parse::<usize>() {
                 Ok(0) => {}
-                Ok(index) if index <= profiles.len() => return Ok(profiles[index - 1].clone()),
+                Ok(index) if index <= visible.len() => return Ok(visible[index - 1].clone()),
                 _ => {
                     writeln!(output, "Invalid selection. Try again.")?;
                     continue;
