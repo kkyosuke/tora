@@ -55,6 +55,57 @@ tora completion zsh               # 補完スクリプトを標準出力へ
 強制終了などでロックが残った場合は、他のインストーラーが動いていないことを確認してから
 空の `update.lock` ディレクトリを `rmdir` で削除してください。
 
+## AWS プロファイルと SSO
+
+AWS CLI v2 を PATH に配置し、`aws configure sso` でプロファイルを設定してください。
+
+```sh
+tora aws profiles                  # 設定済みプロファイルの一覧
+tora aws sso                       # 矢印キーで選択 → SSO ログイン → 認証用シェル
+tora aws sso dev                   # プロファイルを指定して認証用シェルへ
+aws sts get-caller-identity        # シェル内で認証先を確認
+exit                              # 元のシェルに戻る
+```
+
+`dialoguer` による選択メニューは Enter で確定、Esc / q でキャンセルできます。
+「Type a custom profile」で手入力でき、プロファイルがない場合も手入力できます。
+標準入力がターミナルでない場合は番号選択になります（0 で手入力）。
+プロファイルを引数に指定すると一覧取得・選択を省略します。
+
+一覧取得には `aws configure list-profiles` を使うため、`~/.aws/config`、
+`~/.aws/credentials` のほか `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` も
+AWS CLI のルールに従って扱います。SSO ログインは `aws sso login --profile ...` を実行します。
+[詳細は AWS 公式ドキュメント](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)。
+
+ログイン成功後、現在のターミナルで `$SHELL -i`（未設定なら `/bin/sh -i`）を起動し、
+`AWS_PROFILE` を設定します。選択したプロファイルより優先される既存の
+`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_SESSION_TOKEN`、
+`AWS_SECURITY_TOKEN`、`AWS_DEFAULT_PROFILE` は子シェルから外します。
+Zsh / Bash では、プロンプトの先頭に黄色の `[aws:プロファイル名]` を同じ行で表示します。
+既存のプロンプトや設定ファイルを維持し、`exit` で元のシェルに戻ると表示も消えます。
+それ以外のシェルではプロファイル設定のみ行います。
+元のシェルの環境は変わりません。シェル設定ファイルで AWS 環境変数を再設定している場合は、
+その設定が優先されるので `aws sts get-caller-identity` で確認してください。
+認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は再ログインしてください。
+
+```sh
+tora aws sso dev --no-shell                         # ログインだけ実行
+tora aws sso dev --no-browser --use-device-code      # 別デバイスのブラウザーで認証
+```
+
+現在の Bash / Zsh 自体に反映する場合は、ログイン成功時のみ出力するシェル文を評価できます。
+認証メッセージ・選択メニューは標準エラーに出力します。
+
+```sh
+if tora_aws_env=$(tora aws sso dev --export); then
+  eval "$tora_aws_env"
+fi
+unset tora_aws_env
+```
+
+`--export` はシェルを起動せず、上記のアクセスキー環境変数を解除して
+`AWS_PROFILE` を設定する文を出力します。失敗時には何も出力しません。
+
 ## 開発
 
 ```sh
@@ -68,6 +119,8 @@ python3 -m unittest discover -s scripts/tests -v
 
 - `src/cli.rs`: コマンドと引数の定義。便利コマンドは `Commands` に追加します。
 - `src/main.rs`: コマンドの実行と終了コード。
+- `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
+- `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
 - `src/update.rs`: 埋め込みインストーラーによる自己更新。
 - `scripts/install.sh`: 初回インストールと更新で共用する処理。
 - `scripts/tests/`: ネットワークを使わないインストール・失敗時の回帰テスト。

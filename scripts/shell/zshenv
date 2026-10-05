@@ -1,0 +1,39 @@
+# Restore ZDOTDIR before normal global/user startup files run, including macOS
+# session/history hooks. No shell configuration is redirected after this file.
+if [[ $TORA_ZDOTDIR_SET == 1 ]]; then
+    ZDOTDIR=$TORA_ORIGINAL_ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+[[ -r ${ZDOTDIR-$HOME}/.zshenv ]] && source "${ZDOTDIR-$HOME}/.zshenv"
+/bin/rm -f -- "$TORA_SHELL_INIT_DIR/.zshenv"
+/bin/rmdir -- "$TORA_SHELL_INIT_DIR"
+unset TORA_SHELL_INIT_DIR TORA_ORIGINAL_ZDOTDIR TORA_ZDOTDIR_SET
+_tora_aws_badge() {
+    # Restore the undecorated prompt unless the user's theme has replaced it.
+    if [[ $PROMPT == "${_tora_aws_last_prompt-}" ]]; then
+        PROMPT=$_tora_aws_base_prompt
+    fi
+    _tora_aws_base_prompt=$PROMPT
+    _tora_aws_label="[aws:${AWS_PROFILE:-unset}]"
+    if [[ -o PROMPT_PERCENT ]]; then
+        _tora_aws_label=${_tora_aws_label//\%/%%}
+    fi
+    if [[ -o PROMPT_BANG ]]; then
+        _tora_aws_label=${_tora_aws_label//\!/!!}
+    fi
+    local prefix
+    if [[ -o PROMPT_SUBST ]]; then
+        # Expansion of this variable is data, not recursively evaluated shell code.
+        prefix='${_tora_aws_label}'
+    else
+        prefix=$_tora_aws_label
+    fi
+    if [[ -o PROMPT_PERCENT ]]; then
+        prefix='%F{yellow}'"$prefix"'%f'
+    fi
+    PROMPT="$prefix $_tora_aws_base_prompt"
+    _tora_aws_last_prompt=$PROMPT
+}
+typeset -ga precmd_functions
+precmd_functions+=(_tora_aws_badge)
