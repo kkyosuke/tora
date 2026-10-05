@@ -1,0 +1,19 @@
+# Restore ZDOTDIR before normal global/user startup files run, including macOS
+# session/history hooks. No shell configuration is redirected after this file.
+if [[ $TORA_ZDOTDIR_SET == 1 ]]; then
+    ZDOTDIR=$TORA_ORIGINAL_ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+[[ -r ${ZDOTDIR-$HOME}/.zshenv ]] && source "${ZDOTDIR-$HOME}/.zshenv"
+/bin/rm -f -- "$TORA_SHELL_INIT_DIR/.zshenv"
+/bin/rmdir -- "$TORA_SHELL_INIT_DIR"
+unset TORA_SHELL_INIT_DIR TORA_ORIGINAL_ZDOTDIR TORA_ZDOTDIR_SET
+_tora_aws_badge() {
+    # Print as data, never evaluate profile names as shell or prompt syntax.
+    print -Pn '%F{yellow}'
+    print -rn -- "[AWS: ${AWS_PROFILE:-unset}]"
+    print -P '%f'
+}
+typeset -ga precmd_functions
+precmd_functions+=(_tora_aws_badge)

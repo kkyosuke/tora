@@ -84,6 +84,7 @@ fn open_shell(profile: &str) -> io::Result<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut command = Command::new(&shell);
+    let _startup = crate::shell::configure(&mut command, &shell)?;
     command.arg("-i").env("AWS_PROFILE", profile);
     for name in CREDENTIAL_ENV {
         command.env_remove(name);

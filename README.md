@@ -81,6 +81,9 @@ AWS CLI のルールに従って扱います。SSO ログインは `aws sso logi
 `AWS_PROFILE` を設定します。選択したプロファイルより優先される既存の
 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_SESSION_TOKEN`、
 `AWS_SECURITY_TOKEN`、`AWS_DEFAULT_PROFILE` は子シェルから外します。
+Zsh / Bash では、各プロンプトの直前に黄色の `[AWS: プロファイル名]` を表示します。
+既存のプロンプトや設定ファイルを維持し、`exit` で元のシェルに戻ると表示も消えます。
+それ以外のシェルではプロファイル設定のみ行います。
 元のシェルの環境は変わりません。シェル設定ファイルで AWS 環境変数を再設定している場合は、
 その設定が優先されるので `aws sts get-caller-identity` で確認してください。
 認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は再ログインしてください。

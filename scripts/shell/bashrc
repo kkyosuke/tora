@@ -1,0 +1,11 @@
+[[ -r $HOME/.bashrc ]] && source "$HOME/.bashrc"
+/bin/rm -f -- "$TORA_SHELL_INIT_DIR/bashrc"
+/bin/rmdir -- "$TORA_SHELL_INIT_DIR"
+unset TORA_SHELL_INIT_DIR
+_tora_aws_badge() {
+    printf '\033[33m[AWS: %s]\033[0m\n' "${AWS_PROFILE:-unset}"
+}
+case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
+    'declare -a'*) PROMPT_COMMAND+=(_tora_aws_badge) ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_tora_aws_badge" ;;
+esac
