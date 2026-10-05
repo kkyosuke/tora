@@ -3,7 +3,19 @@
 /bin/rmdir -- "$TORA_SHELL_INIT_DIR"
 unset TORA_SHELL_INIT_DIR
 _tora_aws_badge() {
-    printf '\033[33m[AWS: %s]\033[0m\n' "${AWS_PROFILE:-unset}"
+    if [[ $PS1 == "${_tora_aws_last_prompt-}" ]]; then
+        PS1=$_tora_aws_base_prompt
+    fi
+    _tora_aws_base_prompt=$PS1
+    _tora_aws_label="[aws:${AWS_PROFILE:-unset}]"
+    if shopt -q promptvars; then
+        # Use indirect expansion so profile names cannot execute substitutions.
+        PS1='\[\e[33m\]${_tora_aws_label}\[\e[0m\] '"$_tora_aws_base_prompt"
+    else
+        _tora_aws_label=${_tora_aws_label//\\/\\\\}
+        PS1='\[\e[33m\]'"$_tora_aws_label"'\[\e[0m\] '"$_tora_aws_base_prompt"
+    fi
+    _tora_aws_last_prompt=$PS1
 }
 case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
     'declare -a'*) PROMPT_COMMAND+=(_tora_aws_badge) ;;

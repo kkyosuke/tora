@@ -3,6 +3,7 @@ import errno
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import subprocess
@@ -15,7 +16,7 @@ BINARY = ROOT / "target/debug/tora"
 
 
 class ShellBadgeTests(unittest.TestCase):
-    def check_shell(self, shell_name):
+    def check_shell(self, shell_name, dynamic=True, expansion=True):
         shell = shutil.which(shell_name)
         if not shell or not BINARY.exists():
             self.skipTest(f"{shell_name} and cargo build are required")
@@ -31,10 +32,15 @@ class ShellBadgeTests(unittest.TestCase):
             zshenv = 'export USER_ENV_LOADED=yes\n'
             zshrc = 'PROMPT="original> "\nprecmd() { PROMPT="dynamic> "; }\n'
             bashrc = 'PS1="original> "\nPROMPT_COMMAND=\'PS1="dynamic> "\'\n'
+            if not dynamic:
+                zshrc = 'PROMPT="dynamic> "\n'
+                bashrc = 'PS1="dynamic> "\n'
+            zshrc += 'setopt PROMPT_SUBST\n' if expansion else 'unsetopt PROMPT_SUBST\n'
+            bashrc += 'shopt -s promptvars\n' if expansion else 'shopt -u promptvars\n'
             (config / ".zshenv").write_text(zshenv)
             (config / ".zshrc").write_text(zshrc)
             (root / ".bashrc").write_text(bashrc)
-            profile = "dev'$(touch injected)%F{red}`touch injected`"
+            profile = "dev'$(touch injected)%F{red}`touch injected`\\u!"
             env = dict(os.environ, HOME=str(root), ZDOTDIR=str(config),
                        SHELL=shell, TMPDIR=str(root), PATH=f"{root}:{os.environ['PATH']}",
                        TERM="xterm-256color")
@@ -71,7 +77,11 @@ class ShellBadgeTests(unittest.TestCase):
                 text = output.decode(errors="replace")
                 self.assertEqual(status, 0, text)
                 self.assertTrue(sent, text)
-                self.assertGreaterEqual(text.count(f"[AWS: {profile}]"), 2, text)
+                # Ignore terminal control sequences but preserve CR/LF: the badge must
+                # be adjacent to the original prompt, never a line of its own.
+                plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+                self.assertGreaterEqual(plain.count(f"[aws:{profile}] dynamic> "), 2, text)
+                self.assertNotIn(f"[aws:{profile}] [aws:", plain)
                 self.assertFalse((root / "injected").exists(), text)
                 self.assertEqual(list(root.glob("tora-shell-*")), [], text)
                 self.assertEqual((root / ".bashrc").read_text(), bashrc)
@@ -87,3 +97,13 @@ class ShellBadgeTests(unittest.TestCase):
 
     def test_bash_preserves_config_and_adds_safe_badge(self):
         self.check_shell("bash")
+
+    def test_static_prompts_do_not_accumulate_badges(self):
+        for shell in ["zsh", "bash"]:
+            with self.subTest(shell=shell):
+                self.check_shell(shell, dynamic=False)
+
+    def test_disabled_prompt_expansion_is_preserved(self):
+        for shell in ["zsh", "bash"]:
+            with self.subTest(shell=shell):
+                self.check_shell(shell, expansion=False)
