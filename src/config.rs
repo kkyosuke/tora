@@ -1,9 +1,12 @@
-use crate::cli::{ConfigCommand, ConfigKey};
+use crate::{
+    cli::{ConfigCommand, ConfigKey},
+    paths,
+};
+use clap::ValueEnum;
 use std::{
-    env, fs,
+    fs,
     io::{self, Write},
     path::PathBuf,
-    process::Command,
 };
 
 #[derive(Default)]
@@ -12,24 +15,12 @@ pub struct Config {
     pub region: Option<String>,
 }
 
-pub fn home() -> io::Result<PathBuf> {
-    env::var_os("TORA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|v| PathBuf::from(v).join(".tora"))
-        })
-        .ok_or_else(|| io::Error::other("HOME or TORA_HOME is required"))
-}
-
 impl ConfigKey {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Profile => "aws.profile",
-            Self::Region => "aws.region",
-        }
+    fn name(self) -> String {
+        self.to_possible_value()
+            .expect("config keys are visible CLI values")
+            .get_name()
+            .to_owned()
     }
     fn field(self, config: &mut Config) -> &mut Option<String> {
         match self {
@@ -66,11 +57,8 @@ fn parse(text: &str) -> io::Result<Config> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| io::Error::other("invalid config: expected key=value"))?;
-        let key = match key {
-            "aws.profile" => ConfigKey::Profile,
-            "aws.region" => ConfigKey::Region,
-            _ => return Err(io::Error::other("invalid config: unknown key")),
-        };
+        let key = ConfigKey::from_str(key, false)
+            .map_err(|_| io::Error::other("invalid config: unknown key"))?;
         validate(key, value)?;
         if key.field(&mut config).replace(value.to_owned()).is_some() {
             return Err(io::Error::other("invalid config: duplicate key"));
@@ -80,7 +68,7 @@ fn parse(text: &str) -> io::Result<Config> {
 }
 
 pub fn load() -> io::Result<Config> {
-    let path = home()?.join("config");
+    let path = paths::config()?;
     match fs::read_to_string(&path) {
         Ok(text) => parse(&text).map_err(|e| io::Error::other(format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == io::ErrorKind::NotFound && !path.is_symlink() => {
@@ -88,29 +76,6 @@ pub fn load() -> io::Result<Config> {
         }
         Err(e) => Err(e),
     }
-}
-
-pub fn env_value(names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .find_map(|name| env::var(name).ok().filter(|v| !v.is_empty()))
-}
-
-pub fn default_profile() -> io::Result<Option<String>> {
-    Ok(env_value(&["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]).or(load()?.profile))
-}
-
-pub fn region() -> io::Result<Option<String>> {
-    Ok(env_value(&["AWS_REGION", "AWS_DEFAULT_REGION"]).or(load()?.region))
-}
-
-pub fn apply_region(command: &mut Command) -> io::Result<()> {
-    if let Some(region) = region()? {
-        command
-            .env("AWS_REGION", &region)
-            .env("AWS_DEFAULT_REGION", region);
-    }
-    Ok(())
 }
 
 fn contents(config: &Config) -> String {
@@ -134,7 +99,7 @@ impl Drop for Lock {
 }
 
 pub fn run(command: Option<ConfigCommand>) -> io::Result<()> {
-    let path = home()?.join("config");
+    let path = paths::config()?;
     match command.unwrap_or(ConfigCommand::List) {
         ConfigCommand::List => {
             println!("Config: {}", path.display());
@@ -156,31 +121,31 @@ pub fn run(command: Option<ConfigCommand>) -> io::Result<()> {
                 .ok_or_else(|| io::Error::other(format!("{} is not set", key.name())))?;
             println!("{value}");
         }
-        command => {
-            let (key, value) = match command {
-                ConfigCommand::Set { key, value } => {
-                    validate(key, &value)?;
-                    (key, Some(value))
-                }
-                ConfigCommand::Unset { key } => (key, None),
-                _ => unreachable!(),
-            };
-            let parent = path.parent().expect("config has parent");
-            fs::create_dir_all(parent)?;
-            let lock_path = parent.join("config.lock");
-            fs::create_dir(&lock_path).map_err(|e| io::Error::other(format!("cannot acquire {}: {e}; if no config writer is running, remove the empty lock directory", lock_path.display())))?;
-            let _lock = Lock(lock_path);
-            if path.is_symlink() {
-                return Err(io::Error::other("config must not be a symlink"));
-            }
-            let mut config = load()?;
-            *key.field(&mut config) = value;
-            let mut file = tempfile::NamedTempFile::new_in(parent)?;
-            file.write_all(contents(&config).as_bytes())?;
-            file.as_file().sync_all()?;
-            file.persist(&path).map_err(|e| e.error)?;
-            println!("Saved {}", path.display());
+        ConfigCommand::Set { key, value } => {
+            validate(key, &value)?;
+            save(key, Some(value))?;
         }
+        ConfigCommand::Unset { key } => save(key, None)?,
     }
+    Ok(())
+}
+
+fn save(key: ConfigKey, value: Option<String>) -> io::Result<()> {
+    let path = paths::config()?;
+    let parent = path.parent().expect("config has parent");
+    fs::create_dir_all(parent)?;
+    let lock_path = parent.join("config.lock");
+    fs::create_dir(&lock_path).map_err(|e| io::Error::other(format!("cannot acquire {}: {e}; if no config writer is running, remove the empty lock directory", lock_path.display())))?;
+    let _lock = Lock(lock_path);
+    if path.is_symlink() {
+        return Err(io::Error::other("config must not be a symlink"));
+    }
+    let mut config = load()?;
+    *key.field(&mut config) = value;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(contents(&config).as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(&path).map_err(|e| e.error)?;
+    println!("Saved {}", path.display());
     Ok(())
 }

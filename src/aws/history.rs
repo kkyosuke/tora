@@ -8,14 +8,8 @@ const LIMIT: usize = 20;
 const MAX_BYTES: u64 = 64 * 1024;
 
 fn path() -> Option<PathBuf> {
-    std::env::var_os("TORA_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|s| !s.is_empty())
-                .map(|home| PathBuf::from(home).join(".tora"))
-        })
+    crate::paths::home()
+        .ok()
         .map(|home| home.join("aws-profile-history"))
 }
 

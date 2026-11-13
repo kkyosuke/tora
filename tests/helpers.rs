@@ -395,9 +395,9 @@ fn doctor_verifies_installed_binary_and_custom_completion_path() {
         f.path("custom-loader").to_str().unwrap(),
     ]);
     fs::create_dir_all(f.path("tora/bin")).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_tora"), f.path("tora/bin/tora")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tora"), f.path("tora/bin/tora")).unwrap();
     let command = f.command(&[]);
-    // Use the installed copy, retaining the isolated environment.
+    // Use an installed symlink without copying an executable during parallel process spawns.
     let mut installed = Command::new(f.path("tora/bin/tora"));
     installed
         .env_clear()
@@ -421,4 +421,62 @@ fn doctor_verifies_installed_binary_and_custom_completion_path() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("All checks passed"));
     fs::write(f.path("custom-loader"), "broken").unwrap();
     assert!(!installed.output().unwrap().status.success());
+}
+
+#[test]
+fn empty_tora_home_uses_the_same_default_for_all_commands() {
+    let f = Fixture::new();
+    let run = |args: &[&str]| f.command(args).env("TORA_HOME", "").output().unwrap();
+    assert!(
+        run(&["config", "set", "aws.profile", "dev"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(f.path(".tora/config")).unwrap(),
+        "aws.profile=dev\n"
+    );
+    assert!(
+        run(&["aws", "exec", "dev", "--", "/bin/sh", "-c", "exit 0"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(f.path(".tora/aws-profile-history")).unwrap(),
+        "dev\n"
+    );
+    assert!(
+        run(&["completion", "install", "--shell", "bash", "--yes"])
+            .status
+            .success()
+    );
+    assert!(f.path(".tora/completions/bash").is_file());
+    assert!(!f.path("completions").exists());
+    fs::create_dir_all(f.path(".tora/bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tora"), f.path(".tora/bin/tora")).unwrap();
+    let output = run(&["update", "--version", "invalid"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected a stable version"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("self-update requires"));
+    let output = run(&["doctor"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[OK] Installation:"));
+}
+
+#[test]
+fn aws_operation_uses_one_settings_snapshot() {
+    let f = Fixture::new();
+    f.config("aws.profile", "dev");
+    let aws = fs::read_to_string(f.path("tools/aws")).unwrap().replace(
+        "'sts get-caller-identity')",
+        "'sts get-caller-identity')\nprintf 'aws.region=changed-mid-operation\\n' > \"$TORA_HOME/config\"",
+    );
+    f.script("aws", &aws);
+    let text = f.ok(&["aws", "whoami"]);
+    assert!(text.contains("Region: ap-northeast-1"));
+    assert!(!text.contains("changed-mid-operation"));
+    assert!(
+        fs::read_to_string(f.path("tora/config"))
+            .unwrap()
+            .contains("changed-mid-operation")
+    );
 }

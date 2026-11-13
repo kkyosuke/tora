@@ -2,13 +2,18 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("release", ROOT / "scripts/release.py")
 release = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(release)
+sys.path.insert(0, str(ROOT / "scripts"))
+try:
+    spec.loader.exec_module(release)
+finally:
+    sys.path.pop(0)
 
 MANIFEST = '[package]\nname = "tora"\nversion = "1.2.3"\n\n[dependencies]\nfoo = "1.2.3"\n'
 LOCK = 'version = 4\n\n[[package]]\nname = "foo"\nversion = "1.2.3"\n\n[[package]]\nname = "tora"\nversion = "1.2.3"\n'
@@ -32,6 +37,12 @@ class ReleaseTests(unittest.TestCase):
             release.prepare(MANIFEST, LOCK.replace('name = "tora"', 'name = "other"'), "patch")
         with self.assertRaises(ValueError):
             release.prepare(MANIFEST, LOCK.replace('version = "1.2.3"', 'version = "1.2.2"'), "patch")
+
+    def test_ambiguous_package_blocks_are_rejected_even_without_version(self):
+        for extra in ('[[package]]\nname = "tora"\n',
+                      '[[package]]\nname = "tora"\nversion = "1.2.3"\n'):
+            with self.assertRaises(ValueError):
+                release.prepare(MANIFEST, LOCK + extra, "patch")
 
     def exercise(self, overrides=None):
         cache = ROOT / ".cache"
