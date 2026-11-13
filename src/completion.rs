@@ -205,6 +205,20 @@ fn startup_files(shell: InstallShell, home: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn startup_block(shell: InstallShell, destination: &Path) -> String {
+    format!(
+        "{BEGIN}\n{PATH_PREFIX}{}\nif [ -n \"${{{}-}}\" ] && [ -r {} ]; then\n    . {}\nfi\n{END}",
+        destination.display(),
+        if shell == InstallShell::Bash {
+            "BASH_VERSION"
+        } else {
+            "ZSH_VERSION"
+        },
+        quote(destination),
+        quote(destination)
+    )
+}
+
 fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io::Result<()> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if !interactive && !yes {
@@ -305,17 +319,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
         }
     }
     let mut changes = vec![Change::new(destination.clone(), loader(shell))?];
-    let block = format!(
-        "{BEGIN}\n{PATH_PREFIX}{}\nif [ -n \"${{{}-}}\" ] && [ -r {} ]; then\n    . {}\nfi\n{END}",
-        destination.display(),
-        if shell == InstallShell::Bash {
-            "BASH_VERSION"
-        } else {
-            "ZSH_VERSION"
-        },
-        quote(&destination),
-        quote(&destination)
-    );
+    let block = startup_block(shell, &destination);
     for file in files {
         let before = read(&file)?.unwrap_or_default();
         let after = match block_range(&before)? {
@@ -450,6 +454,51 @@ fn apply(changes: &[Change]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Inspect the same managed startup files and custom loader paths as install.
+/// This checks saved configuration, not whether a parent shell has sourced it.
+pub fn diagnose() -> io::Result<String> {
+    let shell = detect_shell().ok_or_else(|| {
+        io::Error::other("could not detect Bash/Zsh; check SHELL or configure completion manually")
+    })?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("HOME is required"))?;
+    for file in startup_files(shell, &home)? {
+        let text = read(&file)?.unwrap_or_default();
+        let range = block_range(&text)?.ok_or_else(|| io::Error::other(format!("no managed completion in {}; run tora completion install --shell {} (manual setups cannot be verified)", file.display(), shell.name())))?;
+        let path = text[range.clone()]
+            .lines()
+            .find_map(|line| line.strip_prefix(PATH_PREFIX))
+            .ok_or_else(|| {
+                io::Error::other(
+                    "completion block has no saved loader path; run tora completion install",
+                )
+            })?;
+        let loader_path = absolute(Path::new(path), &home)?;
+        if text[range] != startup_block(shell, &loader_path) {
+            return Err(io::Error::other(
+                "completion startup block needs repair; run tora completion install",
+            ));
+        }
+        let installed = read(&loader_path)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "missing completion loader {}; run tora completion install",
+                loader_path.display()
+            ))
+        })?;
+        if installed != loader(shell) {
+            return Err(io::Error::other(format!(
+                "completion loader {} needs repair; run tora completion install",
+                loader_path.display()
+            )));
+        }
+    }
+    Ok(format!(
+        "{} completion configuration is installed (open a new shell to load it)",
+        shell.name()
+    ))
 }
 
 #[cfg(test)]

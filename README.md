@@ -31,6 +31,11 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
+| 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証を診断 |
+| AWS の実際の接続先を確認する | `tora aws whoami` | アカウント・ARN・リージョンを表示 |
+| SSO セッションを終了する | `tora aws logout` | 全プロファイルの SSO キャッシュをログアウト |
+| 既定値を保存する | `tora config set aws.profile dev` | プロファイル・リージョンを設定 |
+| 更新があるか確認する | `tora update --check` | バイナリを更新せずバージョンを比較 |
 | 最新版に更新する | `tora update` | 配布バイナリを検証して自己更新 |
 | コマンド入力を楽にする | `tora completion install` | シェルを判定して補完を設定 |
 
@@ -38,6 +43,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 
 - [インストール](#インストール)
 - [使い方](#使い方)
+- [環境診断と設定](#環境診断と設定)
 - [シェル補完](#シェル補完)
 - [AWS プロファイルと SSO](#aws-プロファイルと-sso)
 - [プロファイルを指定してコマンドを実行](#プロファイルを指定してコマンドを実行)
@@ -86,6 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/KKyosuke/tora/main/scripts/install.
 ```sh
 tora --help
 tora --version
+tora update --check               # 更新せずに現在と最新版を比較
 tora update                       # 最新の安定版を導入
 tora update --version v0.1.0       # 指定版を導入（再インストール・ダウングレードも可）
 tora completion zsh               # 補完スクリプトを標準出力へ
@@ -94,6 +101,12 @@ tora completion zsh               # 補完スクリプトを標準出力へ
 `update` は `TORA_HOME/bin/tora`（既定は `~/.tora/bin/tora`）から実行してください。
 ソースビルドや別の配置先のバイナリは自己更新を拒否します。
 更新時は実行中のバイナリに埋め込んだインストーラーを使います。
+`update --check` はソースビルドからも利用でき、インストール先の作成・ロック取得・
+バイナリのダウンロードを行いません。最新版への HTTPS リクエストには `curl` を使います。
+最新版と同じ場合・手元の方が新しい場合も区別して表示します。通信エラーや
+未公開リリースは終了コード1、確認成功は更新の有無にかかわらず0です。
+`--check` と `--version` は併用できません。
+
 環境変数 `TORA_VERSION` は `tora update` では無視し、指定には `--version` を使います。
 
 <details>
@@ -109,6 +122,58 @@ tora completion zsh               # 補完スクリプトを標準出力へ
 空の `update.lock` ディレクトリを `rmdir` で削除してください。
 
 </details>
+
+## 環境診断と設定
+
+```sh
+tora doctor                       # 複数の問題と修復手順をまとめて表示
+tora doctor --profile dev         # 指定プロファイルの認証を確認
+tora config                       # 保存先と設定済みの既定値を表示
+tora config set aws.profile dev
+tora config set aws.region ap-northeast-1
+tora config get aws.profile
+tora config unset aws.region
+```
+
+`doctor` は実行中のバイナリの配置、PATH の優先順、更新に必要なツール、
+Bash/Zsh の補完設定、AWS CLI v2、STS による実際の認証状態を確認します。
+問題があっても残りの診断を続け、すべて正常なら終了コード0、要対応なら1を返します。
+自動修復・SSO ログインは行いません。AWS CLI 自身の認証情報の更新は通常どおり行われます。
+補完は `tora completion install` が保存したカスタムパスにも対応します。
+親シェルが補完を読み込み済みか、手動の補完設定が有効かは判定できません。
+
+設定ファイルは `$TORA_HOME/config`（既定 `~/.tora/config`）です。
+`aws.profile` と `aws.region` だけを保存し、AWS の設定ファイルや認証情報は変更しません。
+`config list` は `config` と同じ動作、`config get` は未設定なら終了コード1です。
+書き込みは同じディレクトリの一時ファイルから置き換え、同時書き込みは
+`config.lock` ディレクトリで拒否します。強制終了でロックが残った場合は、
+他の設定変更が動作していないことを確認して空のディレクトリを削除してください。
+
+プロファイルの優先順位は、明示した引数 → `AWS_PROFILE` → `AWS_DEFAULT_PROFILE` →
+`aws.profile` の保存値です。SSO と exec はすべて未設定なら選択メニューを表示します。
+`aws sso --select` は環境変数と保存値を無視して選び直します。
+リージョンは `AWS_REGION` → `AWS_DEFAULT_REGION` → `aws.region` の保存値 →
+AWS CLI 側の設定の順です。選んだリージョンは子プロセス・認証用シェル・
+`--export` の出力にも反映します。親シェルの環境は変更しません。
+
+### AWS の接続先確認とログアウト
+
+```sh
+tora aws whoami                   # 現在の認証情報のアカウント・ARN・ユーザーID・リージョン
+tora aws whoami dev               # 指定プロファイルで確認
+tora aws logout                   # 全プロファイルの SSO セッションを終了
+```
+
+`whoami` は対話選択や自動ログインを行いません。引数なしでは現在の環境変数の
+アクセスキーを維持して AWS の認証チェーンを使うため、表示されるプロファイル設定より
+環境変数の認証情報が優先される場合があります。実際の接続先はアカウントと ARN で確認してください。
+引数でプロファイルを指定した場合は、SSO / exec と同様に競合するアクセスキー環境変数を外します。
+未設定のリージョンは `(not configured)` と表示します。
+
+`logout` は `aws sso logout` を呼びます。対象は特定のプロファイルだけでなく、
+**全プロファイルの SSO トークンと SSO 由来の一時認証情報のキャッシュ**です。
+親シェルの環境変数は変更しません。
+[AWS CLI の logout 仕様](https://docs.aws.amazon.com/cli/latest/reference/sso/logout.html)。
 
 ## シェル補完
 
@@ -187,7 +252,7 @@ exit                              # 元のシェルに戻る
 標準入力がターミナルでない場合は番号選択になります（0 で手入力）。
 番号選択では `/dev` のように入力して検索、`/` で検索解除できます。
 プロファイルは引数、空でない `AWS_PROFILE`、空でない `AWS_DEFAULT_PROFILE` の順で決定し、
-いずれもなければ選択メニューを表示します。`--select` は環境変数を無視して
+`aws.profile` の保存値を続いて参照し、すべて未設定なら選択メニューを表示します。`--select` は環境変数と保存値を無視して
 選択メニューを表示します（プロファイル引数との併用は不可）。
 
 SSO の認証確認またはログイン成功時と `aws exec` の実行直前に、選択したプロファイル名を
@@ -278,6 +343,8 @@ python3 -m unittest discover -s scripts/tests -v
 - `src/main.rs`: コマンドの実行と終了コード。
 - `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
 - `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
+- `src/config.rs` / `src/doctor.rs`: 既定値の保存と環境診断。
+- `tests/helpers.rs`: 設定・接続先確認・ログアウト・診断・更新確認の結合テスト。
 - `src/update.rs`: 埋め込みインストーラーによる自己更新。
 - `scripts/install.sh`: 初回インストールと更新で共用する処理。
 - `scripts/tests/`: ネットワークを使わないインストール・失敗時の回帰テスト。

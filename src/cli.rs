@@ -14,17 +14,51 @@ pub enum Commands {
         #[command(subcommand)]
         command: AwsCommands,
     },
-    /// Install the latest stable release (or a specific version)
+    /// Check for updates or install a stable release
     Update {
         /// Release version, e.g. v0.1.0 (allows reinstall and downgrade)
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Compare versions without installing (also works with source builds)
+        #[arg(long, conflicts_with = "version")]
+        check: bool,
+    },
+    /// Diagnose installation, PATH, completion and AWS authentication
+    Doctor {
+        /// Check this AWS profile instead of the current credential environment
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show or change tora defaults (does not modify AWS configuration files)
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
     },
     /// Generate or install shell completion
     Completion {
         #[command(subcommand)]
         command: CompletionCommand,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Show all saved defaults and the configuration path
+    List,
+    /// Print a saved value (fails if unset)
+    Get { key: ConfigKey },
+    /// Save a default
+    Set { key: ConfigKey, value: String },
+    /// Remove a default
+    Unset { key: ConfigKey },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ConfigKey {
+    #[value(name = "aws.profile")]
+    Profile,
+    #[value(name = "aws.region")]
+    Region,
 }
 
 #[derive(Subcommand)]
@@ -61,9 +95,16 @@ pub enum InstallShell {
 
 #[derive(Subcommand)]
 pub enum AwsCommands {
+    /// Show account, ARN, user ID and region without logging in
+    Whoami {
+        /// Inspect a specific profile instead of current credentials
+        profile: Option<String>,
+    },
+    /// Log out ALL cached AWS SSO sessions across all profiles
+    Logout,
     /// Run a command with a profile's existing credentials (does not log in)
     Exec {
-        /// Profile name; omit to select interactively
+        /// Profile name; defaults to environment/config, otherwise an interactive menu
         profile: Option<String>,
         /// Command and arguments, after -- (executed without a shell)
         #[arg(last = true, required = true, num_args = 1..)]
@@ -73,9 +114,9 @@ pub enum AwsCommands {
     Profiles,
     /// Log in through IAM Identity Center and open a shell with the selected profile
     Sso {
-        /// Profile name; defaults to AWS_PROFILE / AWS_DEFAULT_PROFILE, otherwise a menu
+        /// Profile name; defaults to environment/config, otherwise a menu
         profile: Option<String>,
-        /// Select a profile interactively, ignoring the current environment
+        /// Select a profile interactively, ignoring environment and saved defaults
         #[arg(long, conflicts_with = "profile")]
         select: bool,
         /// Print a Bash/Zsh export statement after authentication succeeds
@@ -107,7 +148,7 @@ mod tests {
     fn update_version_is_explicit() {
         assert!(matches!(
             Cli::try_parse_from(["tora", "update", "--version", "v0.2.0"]).unwrap().command,
-            Commands::Update { version: Some(v) } if v == "v0.2.0"
+            Commands::Update { version: Some(v), check: false } if v == "v0.2.0"
         ));
         assert!(Cli::try_parse_from(["tora", "update", "--unknown"]).is_err());
     }
