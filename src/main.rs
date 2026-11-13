@@ -2,6 +2,7 @@ mod cli;
 mod completion;
 mod config;
 mod doctor;
+mod paths;
 mod shell;
 mod update;
 

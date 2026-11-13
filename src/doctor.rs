@@ -43,15 +43,14 @@ pub fn run(profile: Option<String>) -> io::Result<()> {
     println!("tora doctor ({})", env!("CARGO_PKG_VERSION"));
     report(
         "Configuration",
-        crate::config::load()
-            .and_then(|_| Ok(crate::config::home()?.join("config").display().to_string())),
+        crate::config::load().and_then(|_| Ok(crate::paths::config()?.display().to_string())),
         &mut failures,
     );
     report(
         "Installation",
         (|| {
-            let installed = crate::config::home()?.join("bin/tora");
-            if installed.canonicalize().ok() != Some(env::current_exe()?.canonicalize()?) {
+            let installed = crate::paths::installed_binary()?;
+            if !crate::paths::is_current_binary(&installed)? {
                 return Err(io::Error::other(format!(
                     "running outside {}; install using scripts/install.sh to enable self-update",
                     installed.display()
@@ -67,7 +66,7 @@ pub fn run(profile: Option<String>) -> io::Result<()> {
             let found = on_path("tora").ok_or_else(|| {
                 io::Error::other("tora not found; add $TORA_HOME/bin (default ~/.tora/bin) to PATH")
             })?;
-            if found.canonicalize()? != env::current_exe()?.canonicalize()? {
+            if !crate::paths::is_current_binary(&found)? {
                 return Err(io::Error::other(format!(
                     "{} shadows this binary; reorder PATH",
                     found.display()

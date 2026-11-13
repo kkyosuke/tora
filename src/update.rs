@@ -1,5 +1,7 @@
 use std::{io, process::Command};
 
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 // Updates use the installer shipped with this exact binary, never a script from main.
 const INSTALLER: &str = include_str!("../scripts/install.sh");
 
@@ -16,12 +18,8 @@ fn installer_command(version: Option<&str>) -> Command {
 
 pub fn run(version: Option<&str>) -> io::Result<()> {
     // Source builds and copies elsewhere must not silently install a different binary.
-    let home = std::env::var_os("TORA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".tora")))
-        .ok_or_else(|| io::Error::other("HOME or TORA_HOME is required"))?;
-    let installed = home.join("bin/tora").canonicalize().ok();
-    if installed.as_deref() != Some(std::env::current_exe()?.canonicalize()?.as_path()) {
+    let installed = crate::paths::installed_binary()?;
+    if !crate::paths::is_current_binary(&installed)? {
         return Err(io::Error::other(
             "self-update requires the installed binary at $TORA_HOME/bin/tora (default: ~/.tora/bin/tora); run scripts/install.sh first",
         ));
@@ -72,8 +70,8 @@ pub fn check() -> io::Result<()> {
             "/dev/null",
             "-w",
             "%{url_effective}",
-            "https://github.com/KKyosuke/tora/releases/latest",
         ])
+        .arg(format!("{REPOSITORY}/releases/latest"))
         .output()
         .map_err(|e| {
             io::Error::other(format!("could not check releases (curl is required): {e}"))
@@ -88,9 +86,8 @@ pub fn check() -> io::Result<()> {
     let url = String::from_utf8_lossy(&output.stdout);
     let version = url
         .trim()
-        .strip_prefix("https://github.com/")
-        .and_then(|path| path.split_once("/releases/tag/v"))
-        .filter(|(repo, _)| repo.eq_ignore_ascii_case("kkyosuke/tora"))
+        .split_once("/releases/tag/v")
+        .filter(|(repo, _)| repo.eq_ignore_ascii_case(REPOSITORY))
         .map(|(_, version)| version)
         .ok_or_else(|| {
             io::Error::other("could not resolve a stable release; check GitHub Releases")

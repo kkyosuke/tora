@@ -52,7 +52,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 
 ## インストール
 
-初回の GitHub Release 公開後、次のワンライナーでインストールできます。
+次のワンライナーで公開済みの最新リリースをインストールできます。
 Rust のインストールは不要です。Bash、curl、tar と SHA-256 計算ツール
 （`sha256sum` または macOS 標準の `shasum`）を使用します。
 
@@ -378,15 +378,14 @@ cargo run -- completion install --shell zsh --yes
 ```sh
 cargo run -- --help
 cargo build
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-python3 -m unittest discover -s scripts/tests -v
+bash scripts/check.sh              # CI・リリースと共通の検証
 ```
 
 - `src/cli.rs`: コマンドと引数の定義。便利コマンドは `Commands` に追加します。
 - `src/main.rs`: コマンドの実行と終了コード。
+- `src/paths.rs`: 保存先とインストール済みバイナリの判定を共通化。
 - `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
+- `src/aws/settings.rs`: 1操作ごとの設定の読み込み、認証環境と export の生成。
 - `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
 - `src/config.rs` / `src/doctor.rs`: 既定値の保存と環境診断。
 - `tests/helpers.rs`: 設定・接続先確認・ログアウト・診断・更新確認の結合テスト。
@@ -442,4 +441,4 @@ GitHub の標準リリースノートを自動生成します。`vMAJOR.MINOR.PA
 publish job を再実行します。
 
 GitHub Actions と `contents: write` 権限が必要です。公開ワンライナーの利用には
-リポジトリと Release が公開されている必要があります。この基盤の追加だけではリリースは公開されません。
+リポジトリと Release が公開されている必要があります。
