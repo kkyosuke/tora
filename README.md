@@ -341,6 +341,40 @@ tora aws exec -- terraform plan    # プロファイルを検索・選択して�
 
 ## 開発
 
+リポジトリ内での `cargo run` / `cargo run --release` / `cargo test` は
+Cargo runner (`scripts/run-dev.sh`) を通し、本番のインストール環境から分離します。
+最適化の有無では区別しないため、`--release` でも開発用の保存先になります。
+
+| 対象 | Cargo 経由の開発実行 | インストール済み tora |
+| --- | --- | --- |
+| 設定・履歴・補完ファイル | `<repo>/.cache/dev/tora/` | `$TORA_HOME`（既定 `~/.tora/`） |
+| シェル起動設定 | `<repo>/.cache/dev/home/` | 通常の `HOME` / `ZDOTDIR` |
+| AWS 設定・SSO キャッシュ | `<repo>/.cache/dev/home/.aws/` | 通常の AWS 設定先 |
+
+インストーラーが export した `TORA_HOME` も、Cargo 実行時には開発用へ置き換えます。
+`HOME`、`ZDOTDIR`、一時ファイル・XDG の保存先も `.cache/dev/` 配下になります。
+本番の AWS プロファイル・リージョン・アクセスキー・設定ファイル指定などの `AWS_*` 環境変数は
+引き継がず、インスタンスメタデータ経由の認証も無効にします。
+開発用の AWS 設定と SSO ログインは別途必要です。例えば：
+
+```sh
+./scripts/run-dev.sh "$(command -v aws)" configure sso
+cargo run -- aws sso dev
+cargo run -- config set aws.profile dev
+cargo run -- completion install --shell zsh --yes
+```
+
+子プロセスから `tora` を呼ぶ場合も、その Cargo 実行で使った開発バイナリを優先します。
+`cargo run -- update` は既存の配置チェックで拒否され、本番バイナリを置き換えません。
+`cargo run -- update --check` によるバージョン確認は利用できます。
+
+この分離は **Cargo runner を通る実行**が対象です。`target/debug/tora` などの直接実行は
+通常の環境を使うため、開発時は `cargo run` または `./scripts/run-dev.sh target/debug/tora ...` を使ってください。
+リポジトリ外から `--manifest-path` だけで起動すると Cargo がこの設定を読まない場合があります。
+その場合は `--config /path/to/tora/.cargo/config.toml` も指定してください。
+任意の外部コマンドや、明示的に指定した絶対パスへのアクセスを制限するサンドボックスではありません。
+配布バイナリと通常の `tora` の保存先・動作は変更しません。
+
 ```sh
 cargo run -- --help
 cargo build
