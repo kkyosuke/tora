@@ -287,9 +287,29 @@ python3 -m unittest discover -s scripts/tests -v
 
 ## リリース
 
-1. `Cargo.toml` の `version` を更新し、`cargo check` で `Cargo.lock` を更新します。
-2. CI が成功した変更を main に反映します。
-3. 同じバージョンのタグを push します。
+最新の main と同じコミットの、未コミット変更がないチェックアウトで実行します。
+Python 3、Rust/Cargo、Git、認証済みの GitHub CLI (`gh auth login`) と
+リポジトリへの push・PR 作成権限が必要です。
+
+```sh
+python3 scripts/release.py
+```
+
+`major` / `minor` / `patch` を次のバージョン表示から選ぶと、
+`Cargo.toml`・`Cargo.lock` を更新し、`release/vX.Y.Z` ブランチにコミット・push して
+main 向けの PR を作成します。種類を直接指定するワンライナーも使えます。
+
+```sh
+python3 scripts/release.py patch
+```
+
+既存のリリースブランチやタグがある場合は上書きせず停止します。
+途中で失敗した場合は変更とブランチを保持します。`git status` を確認して復旧してください。
+push 済みで PR 作成だけ失敗した場合は、そのブランチで `gh pr create --base main` を実行できます。
+
+PR の CI 成功後に main にマージし、最新の main を取得したチェックアウトで
+同じバージョンのタグを push します（以下は `0.1.0` の例）。
+PR 作成やマージだけでは公開されません。
 
 ```sh
 git tag v0.1.0
