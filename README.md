@@ -60,7 +60,14 @@ Rust のインストールは不要です。Bash、curl、tar と SHA-256 計算
 curl -fsSL https://raw.githubusercontent.com/KKyosuke/tora/main/scripts/install.sh | bash
 ```
 
-既定の配置先は `~/.tora/bin/tora` です。シェルの設定ファイルに追加してください。
+既定の配置先は `~/.tora/bin/tora` です。インストール時に `$SHELL` を判定し、
+Zsh は `${ZDOTDIR:-$HOME}/.zshrc`、Bash は `~/.bashrc` とログイン用設定ファイル
+（既存の `.bash_profile` → `.bash_login` → `.profile` の順、なければ `.bash_profile`）へ
+PATH と `TORA_HOME` を自動設定します。再実行時は管理ブロックを更新するため重複しません。
+既存の設定とシンボリックリンクは維持します。
+
+新しいターミナルを開くと `tora` が使えます。今のシェルですぐ使う場合は、
+インストール完了時に表示されるコマンドを実行してください（既定の配置先なら以下）。
 
 ```sh
 export PATH="$HOME/.tora/bin:$PATH"
@@ -82,7 +89,11 @@ Windows、Linux ARM64、musl / Alpine は現時点では対象外です。
 curl -fsSL https://raw.githubusercontent.com/KKyosuke/tora/main/scripts/install.sh | TORA_HOME="$HOME/.local/share/tora" bash -s -- --version v0.1.0
 ```
 
-`TORA_HOME` を変更した場合は、実行時にも同じ値を設定し、`$TORA_HOME/bin` を PATH に追加してください。
+`TORA_HOME` を変更した場合も、その配置先をシェル設定へ保存します。
+Bash/Zsh 以外、`HOME` 未設定、書き込み不可、管理ブロックの破損などで自動設定できない場合は、
+バイナリのインストールを完了したうえで警告と PATH の設定先を表示します。
+その場合は実行時にも同じ `TORA_HOME` を設定し、`$TORA_HOME/bin` を PATH に追加してください。
+PATH で扱えないコロン・改行を含む配置先は使用できません。
 `TORA_VERSION=v0.1.0 bash scripts/install.sh` による指定もできます。
 
 </details>
