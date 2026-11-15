@@ -6,6 +6,8 @@ import re
 import subprocess
 import sys
 
+from release_version import parse_version
+
 ROOT = Path(__file__).resolve().parents[1]
 KINDS = ("major", "minor", "patch")
 
@@ -15,9 +17,7 @@ def run(*args):
 
 
 def bump(version, kind):
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
-        raise ValueError(f"安定版のバージョンが必要です: {version}")
-    parts = list(map(int, version.split(".")))
+    parts = list(parse_version(version))
     index = KINDS.index(kind)
     parts[index] += 1
     parts[index + 1:] = [0] * (2 - index)
@@ -25,19 +25,22 @@ def bump(version, kind):
 
 
 def version_field(text, section, name):
-    blocks = re.split(r"(?m)(?=^\[)", text)
-    matches = []
-    for block in blocks:
+    candidates = []
+    offset = 0
+    for block in re.split(r"(?m)(?=^\[)", text):
         if block.splitlines()[0:1] == [section] and re.search(
             rf'^name = "{re.escape(name)}"$', block, re.M
         ):
-            matches.extend(re.finditer(r'^version = "([^"]+)"$', block, re.M))
-            selected = block
+            candidates.append((block, offset))
+        offset += len(block)
+    if len(candidates) != 1:
+        raise ValueError(f"{section} {name} を一意に取得できません")
+    block, offset = candidates[0]
+    matches = list(re.finditer(r'^version = "([^"]+)"$', block, re.M))
     if len(matches) != 1:
         raise ValueError(f"{section} {name} の version を一意に取得できません")
     match = matches[0]
-    offset = text.index(selected) + match.start(1)
-    return match.group(1), offset
+    return match.group(1), offset + match.start(1)
 
 
 def prepare(manifest, lock, kind):

@@ -89,12 +89,7 @@ fn absolute(path: &Path, home: &Path) -> io::Result<PathBuf> {
 }
 
 fn quote(path: &Path) -> String {
-    format!(
-        "'{}'",
-        path.to_str()
-            .expect("validated path")
-            .replace('\'', "'\\''")
-    )
+    crate::shell::quote(path.to_str().expect("validated path"))
 }
 
 fn read(path: &Path) -> io::Result<Option<String>> {
@@ -282,9 +277,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
             )));
         }
     }
-    let root = env::var_os("TORA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".tora"));
+    let root = crate::paths::home()?;
     let default = absolute(&root.join("completions").join(shell.name()), &home)?;
     let destination = match path.or(existing_path.clone()) {
         Some(path) => absolute(&path, &home)?,
