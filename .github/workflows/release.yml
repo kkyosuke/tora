@@ -2,10 +2,33 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      tag:
+        description: Stable tag to create and publish from the triggering commit
+        required: true
+        type: string
 permissions:
   contents: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 jobs:
+  tag:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate and create immutable tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: bash scripts/tag-release.sh
   build:
+    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -22,17 +45,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Validate release tag
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: python3 scripts/check-release.py
       - run: bash scripts/check.sh
       - run: rustup target add --toolchain stable ${{ matrix.target }}
       - run: cargo +stable build --locked --release --target ${{ matrix.target }}
       - name: Package binary and verification files
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
         run: bash scripts/package.sh
@@ -47,6 +72,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -55,10 +83,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
-        run: |
-          set -euo pipefail
-          # Do not expose a latest release until every platform is available.
-          gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes dist/*
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+        run: bash scripts/publish-release.sh

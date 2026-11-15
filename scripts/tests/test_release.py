@@ -93,6 +93,17 @@ class ReleaseTests(unittest.TestCase):
         for command in [("git", "commit"), ("git", "push"), ("gh", "pr")]:
             self.assertNotIn(command, commands)
 
+    def test_auto_merge_is_opt_in_and_pinned_to_created_commit(self):
+        root, mock = self.exercise()
+        with patch.object(release, "ROOT", root), mock as calls, \
+                patch("sys.argv", ["release.py", "patch", "--auto-merge"]):
+            release.main()
+        self.assertEqual(calls.call_args_list[-1].args,
+                         ("gh", "pr", "merge", "", "--auto", "--squash", "--match-head-commit", "abc"))
+        creation = next(c.args for c in calls.call_args_list if c.args[:3] == ("gh", "pr", "create"))
+        self.assertIn("Auto Release", creation[-1])
+        self.assertNotIn("git tag", creation[-1])
+
     def test_preconditions_stop_before_changes(self):
         for overrides in (
             {("git", "status", "--porcelain"): " M README.md"},
