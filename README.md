@@ -398,6 +398,28 @@ bash scripts/check.sh              # CI・リリースと共通の検証
 
 ## リリース
 
+GitHub の **Actions → Release PR → Run workflow** でブランチに `main`、
+`bump` に `major` / `minor` / `patch` を選ぶと、バージョン更新 PR を作成します。
+GitHub CLI からも実行できます。
+
+```sh
+gh workflow run release-pr.yml --ref main -f bump=patch
+```
+
+最新の main から `Cargo.toml`・`Cargo.lock` を更新し、共通チェックに成功してから
+`release/vX.Y.Z` ブランチと PR を作成します。既存の同名ブランチ・タグは上書きしません。
+実行結果の Summary に PR のリンクを表示します。PR 作成までを行い、マージや公開は行いません。
+
+リポジトリの Settings → Actions → General → Workflow permissions で
+**Allow GitHub Actions to create and approve pull requests** を有効にしてください。
+`GITHUB_TOKEN` で作成された PR の CI は承認待ちになる場合があるため、
+PR に表示される **Approve workflows to run** で開始してください。
+このワークフロー自身も PR 作成前に同じテスト・lint を実行します。
+[GitHub のトークンとワークフロー起動の仕様](https://docs.github.com/en/actions/concepts/security/github_token)。
+ワークフローはこの変更が main にマージされた後に実行画面へ表示されます。
+
+ローカルから PR を作る場合は、以下の方法も利用できます。
+
 最新の main と同じコミットの、未コミット変更がないチェックアウトで実行します。
 Python 3、Rust/Cargo、Git、認証済みの GitHub CLI (`gh auth login`) と
 リポジトリへの push・PR 作成権限が必要です。

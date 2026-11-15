@@ -56,6 +56,8 @@ def prepare(manifest, lock, kind):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kind", nargs="?", choices=KINDS)
+    parser.add_argument("--check", action="store_true",
+                        help="Run the shared checks on the updated version before commit/push")
     args = parser.parse_args()
     paths = [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
     original = [path.read_text() for path in paths]
@@ -88,6 +90,8 @@ def main():
     for path, content in zip(paths, updated):
         path.write_text(content)
     run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
+    if args.check:
+        subprocess.run(["bash", "scripts/check.sh"], cwd=ROOT, check=True)
     run("git", "add", "Cargo.toml", "Cargo.lock")
     run("git", "commit", "-m", f"chore: prepare v{version} release")
     run("git", "push", "-u", "origin", branch)

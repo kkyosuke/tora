@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -68,6 +69,29 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('version = "1.2.4"', (root / "Cargo.lock").read_text())
         self.assertEqual([c for c in commands if c[:2] == ("git", "tag")],
                          [("git", "tag", "--list", "v1.2.4")])
+
+    def test_checks_updated_version_before_publishing(self):
+        root, mock = self.exercise()
+        def verify(*args, **kwargs):
+            self.assertIn('version = "1.2.4"', (root / "Cargo.toml").read_text())
+            self.assertFalse(any(c.args[:2] == ("git", "push") for c in calls.call_args_list))
+        with patch.object(release, "ROOT", root), mock as calls, \
+                patch("sys.argv", ["release.py", "patch", "--check"]), \
+                patch.object(release.subprocess, "run", side_effect=verify) as check:
+            release.main()
+        check.assert_called_once_with(["bash", "scripts/check.sh"], cwd=root, check=True)
+        self.assertEqual(calls.call_args_list[-1].args[:3], ("gh", "pr", "create"))
+
+    def test_failed_checks_do_not_commit_push_or_create_pr(self):
+        root, mock = self.exercise()
+        with patch.object(release, "ROOT", root), mock as calls, \
+                patch("sys.argv", ["release.py", "minor", "--check"]), \
+                patch.object(release.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "check")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.main()
+        commands = [c.args[:2] for c in calls.call_args_list]
+        for command in [("git", "commit"), ("git", "push"), ("gh", "pr")]:
+            self.assertNotIn(command, commands)
 
     def test_preconditions_stop_before_changes(self):
         for overrides in (

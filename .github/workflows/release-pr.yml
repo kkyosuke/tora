@@ -1,0 +1,49 @@
+name: Release PR
+run-name: Prepare ${{ inputs.bump }} release PR
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment
+        required: true
+        type: choice
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require main
+        env:
+          SELECTED_REF: ${{ github.ref }}
+        run: |
+          if [ "$SELECTED_REF" != refs/heads/main ]; then
+            echo 'Run this workflow on main.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Configure commit author
+        run: |
+          git config --local user.name 'github-actions[bot]'
+          git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Validate changes and create version PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+        run: python3 scripts/release.py "$BUMP" --check
+      - name: Link pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr view --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
