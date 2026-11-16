@@ -1,0 +1,30 @@
+name: Auto Release
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml']
+permissions:
+  contents: read
+jobs:
+  detect:
+    runs-on: ubuntu-22.04
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect version increase
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: python3 scripts/detect-release.py
+  release:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.detect.outputs.tag }}

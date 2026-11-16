@@ -399,26 +399,36 @@ bash scripts/check.sh              # CI・リリースと共通の検証
 ## リリース
 
 GitHub の **Actions → Release PR → Run workflow** でブランチに `main`、
-`bump` に `major` / `minor` / `patch` を選ぶと、バージョン更新 PR を作成します。
-GitHub CLI からも実行できます。
+`bump` に `major` / `minor` / `patch` を選ぶと、次の流れでリリースします。
+
+1. 最新 main の `Cargo.toml`・`Cargo.lock` を更新し、共通テスト・lint を実行
+2. `release/vX.Y.Z` の PR を作り、squash auto-merge を有効化
+3. PR の必須 CI が成功すると自動マージ
+4. main のバージョン増加を Auto Release が検知し、同じコミットへタグを作成
+5. 3環境のビルド・検証が成功すると GitHub Release を公開
 
 ```sh
 gh workflow run release-pr.yml --ref main -f bump=patch
 ```
 
-最新の main から `Cargo.toml`・`Cargo.lock` を更新し、共通チェックに成功してから
-`release/vX.Y.Z` ブランチと PR を作成します。既存の同名ブランチ・タグは上書きしません。
-実行結果の Summary に PR のリンクを表示します。PR 作成までを行い、マージや公開は行いません。
+usagi と同じく、Actions secret **`RELEASE_PR_TOKEN`** が必要です。
+このリポジトリの **Contents: Read and write** と **Pull requests: Read and write** を持つ
+専用の fine-grained PAT を登録してください。トークンの利用者にもリポジトリへの書き込み権限が必要です。
+未登録なら PR やブランチを作る前に停止します。リポジトリの auto-merge を有効にし、
+main の必須チェックとして `test` を設定してください（tora では設定済み）。
 
-リポジトリの Settings → Actions → General → Workflow permissions で
-**Allow GitHub Actions to create and approve pull requests** を有効にしてください。
-`GITHUB_TOKEN` で作成された PR の CI は承認待ちになる場合があるため、
-PR に表示される **Approve workflows to run** で開始してください。
-このワークフロー自身も PR 作成前に同じテスト・lint を実行します。
+専用トークンで PR 作成とマージ後の push イベントを発生させ、CI の手動承認を不要にします。
+標準の `GITHUB_TOKEN` で作ったタグに別ワークフローの起動を依存させず、
+Auto Release から reusable な Release ワークフローを直接呼び出します。
 [GitHub のトークンとワークフロー起動の仕様](https://docs.github.com/en/actions/concepts/security/github_token)。
-ワークフローはこの変更が main にマージされた後に実行画面へ表示されます。
 
-ローカルから PR を作る場合は、以下の方法も利用できます。
+PR 作成ワークフローの Summary に PR リンクを表示します。既存の同名ブランチは上書きしません。
+手動でマージしたバージョン更新 PR も自動リリースの対象です。バージョンが同じ場合は公開せず、
+引き下げ・Cargo.lock との不一致はエラーになります。
+
+ローカルからは `python3 scripts/release.py patch --check --auto-merge` で同じ PR を作成できます。
+`--auto-merge` を省略すると PR 作成までで停止しますが、マージ後のリリースは自動です。
+以下はローカルでの基本的な操作です。
 
 最新の main と同じコミットの、未コミット変更がないチェックアウトで実行します。
 Python 3、Rust/Cargo、Git、認証済みの GitHub CLI (`gh auth login`) と
@@ -440,14 +450,8 @@ python3 scripts/release.py patch
 途中で失敗した場合は変更とブランチを保持します。`git status` を確認して復旧してください。
 push 済みで PR 作成だけ失敗した場合は、そのブランチで `gh pr create --base main` を実行できます。
 
-PR の CI 成功後に main にマージし、最新の main を取得したチェックアウトで
-同じバージョンのタグを push します（以下は `0.1.0` の例）。
-PR 作成やマージだけでは公開されません。
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
+PR のマージ後は Auto Release がタグを作成するため、通常は手動のタグ push は不要です。
+手動で作成した `vMAJOR.MINOR.PATCH` タグの push からも同じ Release ワークフローを実行できます。
 
 `.github/workflows/release.yml` がタグと Cargo のバージョンの一致、テスト、lint を確認し、
 以下のアセットを生成します（各アーカイブに `.sha256` と `.version` が付属）。
@@ -459,8 +463,10 @@ git push origin v0.1.0
 全ビルド完了後、すべてのアセットを draft release にアップロードしてから公開します。
 GitHub の標準リリースノートを自動生成します。`vMAJOR.MINOR.PATCH` の安定版のみ対応します。
 公開済みタグ・アセットは変更せず、修正は新しいバージョンとして出してください。
-公開処理に失敗して draft が残った場合は、アセットを確認して公開するか、draft を削除して
-publish job を再実行します。
+失敗した場合は該当 Actions run の失敗ジョブを再実行してください。
+同じコミットの既存タグは再利用し、別コミットのタグは上書きせず停止します。
+残っている draft はアセットを再アップロードして公開を再開できます。
+公開済みの Release はアセットを変更せず成功として終了します。
 
 GitHub Actions と `contents: write` 権限が必要です。公開ワンライナーの利用には
 リポジトリと Release が公開されている必要があります。

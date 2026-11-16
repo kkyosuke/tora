@@ -58,6 +58,8 @@ def main():
     parser.add_argument("kind", nargs="?", choices=KINDS)
     parser.add_argument("--check", action="store_true",
                         help="Run the shared checks on the updated version before commit/push")
+    parser.add_argument("--auto-merge", action="store_true",
+                        help="Enable squash auto-merge after required PR checks pass")
     args = parser.parse_args()
     paths = [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
     original = [path.read_text() for path in paths]
@@ -97,10 +99,14 @@ def main():
     run("git", "push", "-u", "origin", branch)
     body = (f"tora を v{version} に更新します（{kind}）。\n\n"
             "Cargo.toml と Cargo.lock のパッケージバージョンのみを更新します。\n"
-            "CI 成功後に main へマージし、マージ後のコミットで次を実行してください。\n\n"
-            f"```sh\ngit tag v{version} && git push origin v{version}\n```\n")
-    print(run("gh", "pr", "create", "--base", "main", "--head", branch,
-              "--title", f"chore: release v{version}", "--body", body))
+            "main へのマージ後、Auto Release がタグを作成して配布ファイルを公開します。\n")
+    pr_url = run("gh", "pr", "create", "--base", "main", "--head", branch,
+                 "--title", f"chore: release v{version}", "--body", body)
+    print(pr_url)
+    if args.auto_merge:
+        head = run("git", "rev-parse", "HEAD")
+        run("gh", "pr", "merge", pr_url, "--auto", "--squash",
+            "--match-head-commit", head)
 
 
 if __name__ == "__main__":
