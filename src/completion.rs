@@ -7,10 +7,10 @@ use std::{
     process::Command,
 };
 
-use clap::CommandFactory;
+use clap::{CommandFactory, ValueEnum};
 use dialoguer::{Confirm, Input, Select};
 
-use crate::cli::{Cli, CompletionCommand, InstallShell};
+use crate::cli::{Cli, CompletionCommand, ConfigKey, InstallShell};
 
 const BEGIN: &str = "# >>> tora completion >>>";
 const END: &str = "# <<< tora completion <<<";
@@ -80,12 +80,13 @@ _tora_dynamic() {
 compdef _tora_dynamic tora
 "#;
 
-/// Whether the word after `words` is a positional argument named `profile`.
+/// Whether the word after `words` is an AWS profile name: a positional argument
+/// named `profile`, the value of a `--profile` option, or `config set aws.profile`.
 fn completes_profile(words: &[OsString]) -> bool {
     let mut root = Cli::command();
     root.build();
     let mut command = &root;
-    let mut positionals = 0;
+    let mut positionals = Vec::new();
     let mut words = words.iter();
     while let Some(word) = words.next() {
         let Some(word) = word.to_str() else {
@@ -96,6 +97,8 @@ fn completes_profile(words: &[OsString]) -> bool {
             return false;
         }
         let option = match word.strip_prefix("--") {
+            // `--name=value` carries its own value.
+            Some(long) if long.contains('=') => continue,
             Some(long) => command
                 .get_arguments()
                 .find(|arg| arg.get_long() == Some(long)),
@@ -104,20 +107,26 @@ fn completes_profile(words: &[OsString]) -> bool {
                 .find(|arg| arg.get_short() == word.chars().last()),
             None => {
                 match command.find_subcommand(word) {
-                    Some(subcommand) if positionals == 0 => command = subcommand,
-                    _ => positionals += 1,
+                    Some(subcommand) if positionals.is_empty() => command = subcommand,
+                    _ => positionals.push(word),
                 }
                 continue;
             }
         };
         // An option's separate value is not a positional argument.
-        if option.is_some_and(|arg| arg.get_action().takes_values()) {
-            words.next();
+        if let Some(option) = option.filter(|arg| arg.get_action().takes_values()) {
+            if words.next().is_none() {
+                return option.get_id() == "profile";
+            }
         }
+    }
+    if command.get_name() == "set" && positionals.len() == 1 {
+        let profile_key = ConfigKey::Profile.to_possible_value();
+        return profile_key.is_some_and(|key| key.matches(positionals[0], false));
     }
     command
         .get_positionals()
-        .nth(positionals)
+        .nth(positionals.len())
         .is_some_and(|arg| arg.get_id() == "profile")
 }
 
@@ -132,7 +141,7 @@ pub fn answer_profile_request() -> bool {
     let words: Vec<_> = args.skip(1).collect();
     // Completion must stay quiet: a missing or failing AWS CLI means no candidates.
     if completes_profile(&words) {
-        if let Ok(profiles) = crate::aws::profiles() {
+        if let Ok(profiles) = crate::aws::completion_profiles() {
             let mut out = io::stdout().lock();
             for profile in profiles {
                 // A closed pipe only means the shell stopped listening.
@@ -203,12 +212,7 @@ fn absolute(path: &Path, home: &Path) -> io::Result<PathBuf> {
 }
 
 fn quote(path: &Path) -> String {
-    format!(
-        "'{}'",
-        path.to_str()
-            .expect("validated path")
-            .replace('\'', "'\\''")
-    )
+    crate::shell::quote(path.to_str().expect("validated path"))
 }
 
 fn read(path: &Path) -> io::Result<Option<String>> {
@@ -319,6 +323,20 @@ fn startup_files(shell: InstallShell, home: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn startup_block(shell: InstallShell, destination: &Path) -> String {
+    format!(
+        "{BEGIN}\n{PATH_PREFIX}{}\nif [ -n \"${{{}-}}\" ] && [ -r {} ]; then\n    . {}\nfi\n{END}",
+        destination.display(),
+        if shell == InstallShell::Bash {
+            "BASH_VERSION"
+        } else {
+            "ZSH_VERSION"
+        },
+        quote(destination),
+        quote(destination)
+    )
+}
+
 fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io::Result<()> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     if !interactive && !yes {
@@ -382,9 +400,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
             )));
         }
     }
-    let root = env::var_os("TORA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".tora"));
+    let root = crate::paths::home()?;
     let default = absolute(&root.join("completions").join(shell.name()), &home)?;
     let destination = match path.or(existing_path.clone()) {
         Some(path) => absolute(&path, &home)?,
@@ -419,17 +435,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
         }
     }
     let mut changes = vec![Change::new(destination.clone(), loader(shell))?];
-    let block = format!(
-        "{BEGIN}\n{PATH_PREFIX}{}\nif [ -n \"${{{}-}}\" ] && [ -r {} ]; then\n    . {}\nfi\n{END}",
-        destination.display(),
-        if shell == InstallShell::Bash {
-            "BASH_VERSION"
-        } else {
-            "ZSH_VERSION"
-        },
-        quote(&destination),
-        quote(&destination)
-    );
+    let block = startup_block(shell, &destination);
     for file in files {
         let before = read(&file)?.unwrap_or_default();
         let after = match block_range(&before)? {
@@ -566,6 +572,51 @@ fn apply(changes: &[Change]) -> io::Result<()> {
     Ok(())
 }
 
+/// Inspect the same managed startup files and custom loader paths as install.
+/// This checks saved configuration, not whether a parent shell has sourced it.
+pub fn diagnose() -> io::Result<String> {
+    let shell = detect_shell().ok_or_else(|| {
+        io::Error::other("could not detect Bash/Zsh; check SHELL or configure completion manually")
+    })?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("HOME is required"))?;
+    for file in startup_files(shell, &home)? {
+        let text = read(&file)?.unwrap_or_default();
+        let range = block_range(&text)?.ok_or_else(|| io::Error::other(format!("no managed completion in {}; run tora completion install --shell {} (manual setups cannot be verified)", file.display(), shell.name())))?;
+        let path = text[range.clone()]
+            .lines()
+            .find_map(|line| line.strip_prefix(PATH_PREFIX))
+            .ok_or_else(|| {
+                io::Error::other(
+                    "completion block has no saved loader path; run tora completion install",
+                )
+            })?;
+        let loader_path = absolute(Path::new(path), &home)?;
+        if text[range] != startup_block(shell, &loader_path) {
+            return Err(io::Error::other(
+                "completion startup block needs repair; run tora completion install",
+            ));
+        }
+        let installed = read(&loader_path)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "missing completion loader {}; run tora completion install",
+                loader_path.display()
+            ))
+        })?;
+        if installed != loader(shell) {
+            return Err(io::Error::other(format!(
+                "completion loader {} needs repair; run tora completion install",
+                loader_path.display()
+            )));
+        }
+    }
+    Ok(format!(
+        "{} completion configuration is installed (open a new shell to load it)",
+        shell.name()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn completes_profiles_only_at_profile_positionals() {
+    fn completes_profiles_only_where_a_profile_is_expected() {
         let at = |words: &[&str]| {
             completes_profile(&words.iter().map(OsString::from).collect::<Vec<_>>())
         };
@@ -588,6 +639,11 @@ mod tests {
             &["aws", "exec"],
             &["aws", "sso", "--no-browser"],
             &["aws", "sso", "--no-shell", "--use-device-code"],
+            &["aws", "whoami"],
+            &["aws", "exec", "--login"],
+            &["aws", "exec", "--login", "--no-browser"],
+            &["doctor", "--profile"],
+            &["config", "set", "aws.profile"],
         ] {
             assert!(at(words), "{words:?}");
         }
@@ -604,6 +660,17 @@ mod tests {
             &["help", "aws", "sso"],
             &["update", "--version"],
             &["completion", "install", "--path"],
+            &["aws", "whoami", "dev"],
+            &["aws", "logout"],
+            &["doctor"],
+            &["doctor", "--profile", "dev"],
+            &["doctor", "--profile=dev"],
+            &["config", "set"],
+            &["config", "set", "aws.region"],
+            &["config", "set", "aws.profile", "dev"],
+            &["config", "get"],
+            &["config", "unset", "aws.profile"],
+            &["aws", "exec", "--login", "dev", "--"],
         ] {
             assert!(!at(words), "{words:?}");
         }

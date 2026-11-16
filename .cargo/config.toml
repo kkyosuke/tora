@@ -1,0 +1,4 @@
+# Keep cargo run/test/bench separate from the installed tora environment.
+# Cargo resolves this executable relative to the repository root.
+[target.'cfg(unix)']
+runner = ["./scripts/run-dev.sh"]
