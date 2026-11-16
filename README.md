@@ -31,6 +31,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
+| 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
 | 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証を診断 |
 | AWS の実際の接続先を確認する | `tora aws whoami` | アカウント・ARN・リージョンを表示 |
 | SSO セッションを終了する | `tora aws logout` | 全プロファイルの SSO キャッシュをログアウト |
@@ -327,7 +328,11 @@ unset tora_aws_env
 tora aws exec dev -- terraform plan
 tora aws exec dev -- aws sts get-caller-identity
 tora aws exec -- terraform plan    # プロファイルを検索・選択して実行
+tora aws exec --login dev -- terraform plan    # 必要な場合だけ SSO ログインしてから実行
 ```
+
+プロファイルを省略すると、`AWS_PROFILE` → `AWS_DEFAULT_PROFILE` → `aws.profile` の保存値 →
+選択メニューの順で決まります（[環境診断と設定](#環境診断と設定)）。`--login` でも同じです。
 
 `--` 以降をコマンドと引数として、そのまま実行します。シェルによる追加の解釈は行いません。
 子プロセスに `AWS_PROFILE` を設定し、認証用シェルと同じアクセスキー環境変数を解除します。
@@ -335,8 +340,22 @@ tora aws exec -- terraform plan    # プロファイルを検索・選択して�
 対応プラットフォーム（macOS / Linux）ではプロセスを置き換えるため、終了コードと
 シグナル終了もそのまま呼び出し元に伝わります。
 
-既存の認証情報を使い、自動で SSO ログインは行いません。
-必要なら先に `tora aws sso dev --no-shell` を実行してください。
+既定では既存の認証情報を使い、自動で SSO ログインは行いません。
+`--login` を付けると、実行前に `tora aws sso` と同じ方法で認証を確認します。
+有効ならそのまま実行し、未ログイン・期限切れなど既知の認証エラーの場合だけ
+`aws sso login` を実行します。その他のエラーやログイン失敗時は、コマンドを実行せずに
+0 以外で終了します。認証確認・ログインのメッセージは標準エラー出力へ書き出すため、
+子コマンドの標準出力はそのままパイプに渡せます。
+
+`--login`、`--no-browser`、`--use-device-code` は `--` より前に指定します
+（`--` 以降は子コマンドの引数です）。`--no-browser` / `--use-device-code` には
+`--login` が必要です。
+
+```sh
+tora aws exec --login dev -- aws s3 ls | sort
+tora aws exec --login --no-browser dev -- terraform plan
+```
+
 パイプ入力を子コマンドへ渡す場合は、プロファイルを明示して選択操作を省略してください。
 
 ## 開発

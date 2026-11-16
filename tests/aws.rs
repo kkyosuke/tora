@@ -519,6 +519,123 @@ fn exec_can_select_search_or_cancel_without_logging_in() {
 }
 
 #[test]
+fn exec_login_reuses_valid_credentials_without_logging_in() {
+    for args in [
+        ["exec", "--login", "dev", "--", "shell", "arg"],
+        ["exec", "dev", "--login", "--", "shell", "arg"],
+    ] {
+        let f = Fixture::new();
+        let output = f
+            .command(&args)
+            .env("CHECK_STATUS", "0")
+            .env("SHELL_STATUS", "23")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        let out = String::from_utf8(output.stdout).unwrap();
+        assert!(out.starts_with("shell:arg:dev\n"), "{out}");
+        assert!(out.contains("credentials:unset:unset:unset:unset:unset"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("skipping login"));
+        assert_eq!(f.calls(), "sts\nget-caller-identity\n--profile\ndev\n");
+        assert_eq!(
+            fs::read_to_string(f.0.join("tora/aws-profile-history")).unwrap(),
+            "dev\n"
+        );
+    }
+}
+
+#[test]
+fn exec_login_logs_in_when_expired_and_keeps_stdout_for_the_command() {
+    let f = Fixture::new();
+    let output = f
+        .command(&[
+            "exec",
+            "--login",
+            "--no-browser",
+            "--use-device-code",
+            "dev",
+            "--",
+            "shell",
+            "arg",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(out.starts_with("shell:arg:dev\n"), "{out}");
+    assert!(!out.contains("login output"));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("login output"));
+    assert!(err.contains("SSO login completed"));
+    assert_eq!(
+        f.calls(),
+        "sts\nget-caller-identity\n--profile\ndev\nsso\nlogin\n--profile\ndev\n--no-browser\n--use-device-code\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-profile-history")).unwrap(),
+        "dev\n"
+    );
+}
+
+#[test]
+fn exec_login_failure_never_runs_the_command() {
+    for (name, value, calls) in [
+        (
+            "LOGIN_STATUS",
+            "3",
+            "sts\nget-caller-identity\n--profile\ndev\nsso\nlogin\n--profile\ndev\n",
+        ),
+        (
+            "CHECK_ERROR",
+            "Could not connect to the endpoint URL",
+            "sts\nget-caller-identity\n--profile\ndev\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.script("child", "#!/bin/sh\ntouch ran\n");
+        let output = f
+            .command(&["exec", "--login", "dev", "--", "child"])
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert_eq!(f.calls(), calls);
+        assert!(!f.0.join("ran").exists());
+        assert!(!f.0.join("tora/aws-profile-history").exists());
+    }
+}
+
+#[test]
+fn exec_login_options_require_login_and_stay_literal_after_separator() {
+    for option in ["--no-browser", "--use-device-code"] {
+        let f = Fixture::new();
+        let output = f
+            .command(&["exec", "dev", option, "--", "shell"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--login"));
+        assert!(f.calls().is_empty());
+    }
+    let f = Fixture::new();
+    f.script("child", "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    let output = f
+        .command(&["exec", "dev", "--", "child", "--login", "--no-browser"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"--login\n--no-browser\n");
+    assert!(f.calls().is_empty());
+}
+
+#[test]
 fn history_is_shared_deduplicated_and_does_not_change_profiles_output() {
     let f = Fixture::new();
     assert!(

@@ -102,10 +102,19 @@ pub enum AwsCommands {
     },
     /// Log out ALL cached AWS SSO sessions across all profiles
     Logout,
-    /// Run a command with a profile's existing credentials (does not log in)
+    /// Run a command with a profile's credentials (logs in only with --login)
     Exec {
         /// Profile name; defaults to environment/config, otherwise an interactive menu
         profile: Option<String>,
+        /// Check authentication first and log in through SSO only when needed
+        #[arg(long)]
+        login: bool,
+        /// Do not automatically open the browser
+        #[arg(long, requires = "login")]
+        no_browser: bool,
+        /// Use device-code authorization for login from another device
+        #[arg(long, requires = "login")]
+        use_device_code: bool,
         /// Command and arguments, after -- (executed without a shell)
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<std::ffi::OsString>,

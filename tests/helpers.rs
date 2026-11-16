@@ -30,6 +30,7 @@ case "$1 $2" in
   'configure get') printf '%s\n' "${TEST_REGION:-ap-northeast-1}"; exit "${TEST_REGION_STATUS:-0}";;
   'configure list-profiles') printf 'default\ndev\n';;
   'sso logout') exit "${TEST_LOGOUT_STATUS:-0}";;
+  'sso login') printf 'login output\n'; exit "${TEST_LOGIN_STATUS:-0}";;
   *) printf 'unexpected AWS command\n' >&2; exit 7;;
 esac
 "#);
@@ -210,6 +211,58 @@ fn sso_uses_saved_defaults_and_export_propagates_region() {
         !fs::read_to_string(f.path("calls"))
             .unwrap()
             .contains("login")
+    );
+}
+
+#[test]
+fn exec_login_uses_saved_defaults_for_check_login_and_command() {
+    let f = Fixture::new();
+    f.config("aws.profile", "saved");
+    f.config("aws.region", "eu-west-1");
+    let args = [
+        "aws",
+        "exec",
+        "--login",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf '%s:%s' \"$AWS_PROFILE\" \"$AWS_REGION\"",
+    ];
+    assert_eq!(f.ok(&args), "saved:eu-west-1");
+    assert!(
+        !fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .contains("login")
+    );
+    fs::write(f.path("calls"), "").unwrap();
+    fs::write(f.path("environment"), "").unwrap();
+    let out = f
+        .command(&args)
+        .env(
+            "TEST_AUTH_ERROR",
+            "Error when retrieving token from sso: Token has expired and refresh failed",
+        )
+        .output()
+        .unwrap();
+    // The stub keeps failing the check, but login runs and the command still executes.
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"saved:eu-west-1");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("login output"));
+    assert!(
+        fs::read_to_string(f.path("calls"))
+            .unwrap()
+            .contains("sso\nlogin\n--profile\nsaved\n")
+    );
+    let environment = fs::read_to_string(f.path("environment")).unwrap();
+    assert_eq!(environment.lines().count(), 2, "{environment}");
+    assert!(
+        environment
+            .lines()
+            .all(|line| line == "profile=saved key= region=eu-west-1 default_region=eu-west-1")
     );
 }
 
