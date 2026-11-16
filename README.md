@@ -30,6 +30,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | --- | --- | --- |
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
+| 今の認証状態を確認する | `tora aws status` | プロファイル・認証先・SSO 期限の残り時間を表示 |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
 | 最新版に更新する | `tora update` | 配布バイナリを検証して自己更新 |
 | コマンド入力を楽にする | `tora completion install` | シェルを判定して補完を設定 |
@@ -170,7 +171,7 @@ tora aws profiles                  # 設定済みプロファイルの一覧
 tora aws sso                       # 現在のプロファイルで認証確認 → 必要ならログイン → シェル
 tora aws sso --select              # プロファイルを選び直して認証用シェルへ
 tora aws sso dev                   # プロファイルを指定して認証用シェルへ
-aws sts get-caller-identity        # シェル内で認証先を確認
+tora aws status                    # プロファイル・認証先・SSO 期限の残り時間を確認
 exit                              # 元のシェルに戻る
 ```
 
@@ -216,7 +217,52 @@ Zsh / Bash では、プロンプトの先頭に黄色の `[aws:プロファイ�
 それ以外のシェルではプロファイル設定のみ行います。
 元のシェルの環境は変わりません。シェル設定ファイルで AWS 環境変数を再設定している場合は、
 その設定が優先されるので `aws sts get-caller-identity` で確認してください。
-認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は `tora aws sso` を再実行してください。
+認証用シェルを開くだけでは認証期限は延長されません。残り時間は `tora aws status` で確認し、
+期限切れ時は `tora aws sso` を再実行してください。
+
+</details>
+
+### 認証状態を確認する
+
+```sh
+tora aws status                    # 現在のプロファイルの認証状態
+tora aws status dev                # プロファイルを指定
+```
+
+```text
+Profile:     dev
+Account:     123456789012
+Arn:         arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_0123456789abcdef/alice
+Role:        AWSReservedSSO_Admin_0123456789abcdef
+SSO expires: 2026-11-16T09:30:00Z (3h 12m remaining)
+```
+
+プロファイルは `tora aws sso` と同じ規則（引数、空でない `AWS_PROFILE`、空でない
+`AWS_DEFAULT_PROFILE`、いずれもなければ選択メニュー）で決定します。
+未ログイン・期限切れの場合は `tora aws sso` を案内して終了コード 1 で終了します。
+自動でログインはしません。
+
+<details>
+<summary>認証状態の確認方法と SSO 期限の求め方</summary>
+
+認証先は `aws sts get-caller-identity --profile ...` で確認し、Account と Arn を表示します。
+ロールの Arn の場合はロール名も表示します。確認時は `tora aws sso` と同じく、
+競合するアクセスキー環境変数を外します。通信障害・設定不備など、
+未ログイン・期限切れ以外のエラーは表示して停止します。
+
+SSO 期限は `aws configure get` で `sso_session`（なければ `sso_start_url`）を取得し、
+`~/.aws/sso/cache/` にある対応するキャッシュファイルの `expiresAt` から求めます。
+`sso-session` を使う設定と、プロファイルに `sso_start_url` を直接書く従来の設定の
+両方に対応します。時刻はキャッシュの記録どおり（UTC）に表示します。
+SSO を使わないプロファイルやキャッシュが見つからない場合など、判定できなければ
+`unknown` と表示し、失敗にはしません。キャッシュからは期限だけを読み取り、
+トークンの値は表示・出力しません。
+
+`sso-session` を使う設定では、表示される期限は現在のアクセストークンのものです。
+SSO セッションが続く間は AWS CLI が自動更新するため、
+`refreshed automatically while the SSO session lasts` と表示します。
+SSO トークンの期限後も、取得済みのロール認証情報が有効な間は認証に成功し、
+期限は `(expired)` と表示されます。
 
 </details>
 
@@ -277,6 +323,7 @@ python3 -m unittest discover -s scripts/tests -v
 - `src/cli.rs`: コマンドと引数の定義。便利コマンドは `Commands` に追加します。
 - `src/main.rs`: コマンドの実行と終了コード。
 - `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
+- `src/aws/status.rs`: 認証先と SSO 期限の表示。
 - `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
 - `src/update.rs`: 埋め込みインストーラーによる自己更新。
 - `scripts/install.sh`: 初回インストールと更新で共用する処理。

@@ -1,11 +1,12 @@
 mod history;
+mod status;
 
 use crate::cli::AwsCommands;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::{
     collections::HashSet,
     io::{self, BufRead, IsTerminal, Write},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
@@ -43,15 +44,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             no_browser,
             use_device_code,
         } => {
-            let profile = profile.or_else(|| {
-                if select {
-                    None
-                } else {
-                    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
-                        .into_iter()
-                        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-                }
-            });
+            let profile = profile.or_else(|| if select { None } else { current_profile() });
             let profile = resolve_profile(profile)?;
             if credentials_valid(&profile)? {
                 eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
@@ -88,7 +81,16 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             }
             Ok(())
         }
+        AwsCommands::Status { profile } => {
+            status::run(&resolve_profile(profile.or_else(current_profile))?)
+        }
     }
+}
+
+fn current_profile() -> Option<String> {
+    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
 }
 
 // Static credentials take precedence over AWS_PROFILE. Remove them only in the
@@ -114,6 +116,11 @@ fn credentials_valid(profile: &str) -> io::Result<bool> {
         .stdout(Stdio::null())
         .output()
         .map_err(aws_error)?;
+    authenticated(profile, &output)
+}
+
+// Ok(false) means a login is needed; unrelated failures are reported as errors.
+fn authenticated(profile: &str, output: &Output) -> io::Result<bool> {
     if output.status.success() {
         return Ok(true);
     }

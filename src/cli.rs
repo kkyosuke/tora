@@ -91,6 +91,11 @@ pub enum AwsCommands {
         #[arg(long)]
         use_device_code: bool,
     },
+    /// Show the profile, caller identity and SSO expiry (does not log in)
+    Status {
+        /// Profile name; defaults to AWS_PROFILE / AWS_DEFAULT_PROFILE, otherwise a menu
+        profile: Option<String>,
+    },
 }
 
 #[cfg(test)]
