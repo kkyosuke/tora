@@ -218,7 +218,16 @@ Zsh の `ZDOTDIR` を使う場合は、実行前に環境変数として export 
 Zsh では説明も表示できます。現在のシェルで有効にするコマンドは完了時に表示します。
 補完はシェル起動時に PATH 上の `tora` から生成するため、更新後の新しいシェルにも追従します。
 設定ファイルの途中で `return` / `exit` する場合は、追加した管理ブロックをその前に移してください。
-AWS プロファイル名の動的な Tab 補完には対応していません。
+
+Zsh / Bash では、プロファイルを指定する位置で Tab を押すと
+`aws configure list-profiles` で得られるプロファイル名を補完します。対象は
+`tora aws sso` / `tora aws exec` / `tora aws whoami` のプロファイル引数、
+`tora doctor --profile`、`tora config set aws.profile` の値です。`tora aws exec` の
+`--` より後（実行するコマンド）では補完しません。AWS CLI が見つからない・失敗した場合は
+エラーを表示せず、プロファイル名の候補を出さないだけです。Tab のたびに AWS CLI を呼ぶため、
+候補の表示までに少し時間がかかることがあります。
+設定済みの場合も `tora completion install` の再実行は不要で、tora の更新後に新しいシェルを開けば有効になります。
+fish / powershell / elvish はプロファイル名の補完に対応していません。
 
 再実行時は保存済みのパスを使い、同じ内容なら何も変更しません。
 変更があれば `# >>> tora completion >>>` から `# <<< tora completion <<<` までを更新し、
@@ -409,6 +418,8 @@ bash scripts/check.sh              # CI・リリースと共通の検証
 - `src/config.rs` / `src/doctor.rs`: 既定値の保存と環境診断。
 - `tests/helpers.rs`: 設定・接続先確認・ログアウト・診断・更新確認の結合テスト。
 - `src/update.rs`: 埋め込みインストーラーによる自己更新。
+- `src/completion.rs`: 補完スクリプトの生成・インストールと、プロファイル名の動的補完。
+- `tests/completion.rs`: 補完のインストールと実際の Bash での補完の結合テスト。
 - `scripts/install.sh`: 初回インストールと更新で共用する処理。
 - `scripts/tests/`: ネットワークを使わないインストール・失敗時の回帰テスト。
 

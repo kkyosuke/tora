@@ -266,6 +266,12 @@ fn aws_error(error: io::Error) -> io::Error {
     }
 }
 
+/// Profile names for shell completion. Listing profiles does not depend on
+/// saved defaults, so a broken tora config cannot hide candidates.
+pub(crate) fn completion_profiles() -> io::Result<Vec<String>> {
+    profiles(&Settings::default())
+}
+
 fn profiles(settings: &Settings) -> io::Result<Vec<String>> {
     // AWS CLI handles config, credentials, default, sso-session sections and custom paths.
     let output = settings
