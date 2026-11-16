@@ -10,8 +10,17 @@ use std::{
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
     match command {
-        AwsCommands::Exec { profile, command } => {
+        AwsCommands::Exec {
+            profile,
+            login,
+            no_browser,
+            use_device_code,
+            command,
+        } => {
             let profile = resolve_profile(profile)?;
+            if login {
+                ensure_login(&profile, no_browser, use_device_code)?;
+            }
             let mut child = Command::new(&command[0]);
             child.args(&command[1..]);
             configure_profile(&mut child, &profile);
@@ -53,30 +62,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
                 }
             });
             let profile = resolve_profile(profile)?;
-            if credentials_valid(&profile)? {
-                eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
-            } else {
-                eprintln!("Logging in with AWS profile {profile:?}...");
-                let mut command = profile_command(&profile);
-                command.args(["sso", "login", "--profile", &profile]);
-                if no_browser {
-                    command.arg("--no-browser");
-                }
-                if use_device_code {
-                    command.arg("--use-device-code");
-                }
-                // Preserve browser/device login interaction while keeping stdout safe to eval.
-                let status = command
-                    .stdout(Stdio::from(io::stderr()))
-                    .status()
-                    .map_err(aws_error)?;
-                if !status.success() {
-                    return Err(io::Error::other(format!(
-                        "aws sso login failed for profile {profile:?}: {status}"
-                    )));
-                }
-                eprintln!("SSO login completed for profile {profile:?}.");
-            }
+            ensure_login(&profile, no_browser, use_device_code)?;
             history::remember(&profile);
             if export {
                 writeln!(io::stdout().lock(), "{}", export_statement(&profile))?;
@@ -138,6 +124,36 @@ fn credentials_valid(profile: &str) -> io::Result<bool> {
         output.status,
         error.trim()
     )))
+}
+
+// Reuse valid credentials and log in only for known missing/expired authentication.
+// All messages and login output go to stderr so stdout stays safe to eval or pipe.
+fn ensure_login(profile: &str, no_browser: bool, use_device_code: bool) -> io::Result<()> {
+    if credentials_valid(profile)? {
+        eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
+    } else {
+        eprintln!("Logging in with AWS profile {profile:?}...");
+        let mut command = profile_command(profile);
+        command.args(["sso", "login", "--profile", profile]);
+        if no_browser {
+            command.arg("--no-browser");
+        }
+        if use_device_code {
+            command.arg("--use-device-code");
+        }
+        // Preserve browser/device login interaction while keeping stdout safe to eval.
+        let status = command
+            .stdout(Stdio::from(io::stderr()))
+            .status()
+            .map_err(aws_error)?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "aws sso login failed for profile {profile:?}: {status}"
+            )));
+        }
+        eprintln!("SSO login completed for profile {profile:?}.");
+    }
+    Ok(())
 }
 
 fn open_shell(profile: &str) -> io::Result<()> {
