@@ -34,6 +34,11 @@ if [ -z "$version" ]; then
     valid_version "$version" || fail 'could not resolve a stable release; check GitHub Releases'
 fi
 root=${TORA_HOME:-${HOME:?HOME or TORA_HOME is required}/.tora}
+case "$root" in
+    *:*|*$'\n'*|*$'\r'*) fail 'install path must not contain colon or newline characters' ;;
+esac
+mkdir -p "$root"
+root=$(cd "$root" && pwd -P)
 bin="$root/bin"
 mkdir -p "$bin"
 # Fail closed on contention; never guess whether another updater is still alive.
@@ -82,7 +87,72 @@ chmod 755 "$stage/tora"
 # Staging inside bin guarantees replacement by rename on the same filesystem.
 mv -f -- "$stage/tora" "$bin/tora"
 printf 'Installed tora %s at %s/tora\n' "$version" "$bin"
+# The piped installer runs in Bash even for Zsh users; use the login shell.
+configure_path() {
+    local shell_name=${SHELL:-} file login index=0
+    shell_name=${shell_name##*/}
+    local files=()
+    [ -n "${HOME:-}" ] || { printf 'HOME is unset; configure PATH manually.\n' >&2; return 1; }
+    case "$shell_name" in
+        zsh) files=("${ZDOTDIR:-$HOME}/.zshrc") ;;
+        bash)
+            files=("$HOME/.bashrc")
+            login="$HOME/.bash_profile"
+            for file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+                if [ -e "$file" ] || [ -L "$file" ]; then login=$file; break; fi
+            done
+            files+=("$login") ;;
+        *) printf 'Automatic PATH setup supports Bash/Zsh; current SHELL is %s.\n' "${SHELL:-unset}" >&2; return 1 ;;
+    esac
+    # Single-quote the path as literal shell data, including spaces and quotes.
+    local quoted=${root//\'/\'\\\'\'}
+    {
+        printf '# >>> tora PATH >>>\n'
+        printf "export TORA_HOME='%s'\n" "$quoted"
+        cat <<'BLOCK'
 case ":$PATH:" in
-    *":$bin:"*) ;;
-    *) printf 'Add this directory to PATH in your shell configuration:\n  %s\n' "$bin" ;;
+    *":$TORA_HOME/bin:"*) ;;
+    *) export PATH="$TORA_HOME/bin:$PATH" ;;
 esac
+# <<< tora PATH <<<
+BLOCK
+    } > "$stage/path-block" || return 1
+    # Prepare every file before writing, and refuse damaged/duplicate markers.
+    for file in "${files[@]}"; do
+        if [ -L "$file" ] && [ ! -f "$file" ]; then
+            printf 'Cannot update broken/non-file symlink: %s\n' "$file" >&2; return 1
+        fi
+        if [ -e "$file" ] && { [ ! -f "$file" ] || [ ! -w "$file" ]; }; then
+            printf 'Startup file is not writable: %s\n' "$file" >&2; return 1
+        fi
+        local input="$file"
+        [ -e "$input" ] || input=/dev/null
+        awk '
+            FNR == NR { block = block $0 "\n"; next }
+            $0 == "# >>> tora PATH >>>" { if (starts++ || inside || ends) exit 1; inside=1; printf "%s", block; next }
+            $0 == "# <<< tora PATH <<<" { if (!inside || ends++) exit 1; inside=0; next }
+            !inside { print }
+            END {
+                if (inside || starts != ends || starts > 1 || ends > 1) exit 1
+                if (!starts) printf "\n%s", block
+            }
+        ' "$stage/path-block" "$input" > "$stage/startup-$index" || {
+            printf 'Invalid tora PATH markers in %s; repair them before retrying.\n' "$file" >&2
+            return 1
+        }
+        index=$((index + 1))
+    done
+    index=0
+    for file in "${files[@]}"; do
+        mkdir -p "${file%/*}" || return 1
+        # Follow existing dotfile symlinks and retain their permissions.
+        cat "$stage/startup-$index" > "$file" || return 1
+        printf 'Configured PATH in %s\n' "$file"
+        index=$((index + 1))
+    done
+    printf 'Open a new %s shell to use tora, or run in this shell:\n' "$shell_name"
+    printf "  export TORA_HOME='%s'; export PATH=\"\$TORA_HOME/bin:\$PATH\"\n" "$quoted"
+}
+if ! configure_path; then
+    printf 'tora: Installed successfully, but PATH setup needs attention. Add this directory to PATH: %s\n' "$bin" >&2
+fi

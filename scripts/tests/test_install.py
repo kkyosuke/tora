@@ -26,7 +26,9 @@ class InstallerTests(unittest.TestCase):
         self.fixture.mkdir()
         self.asset = "tora-linux-amd64.tar.gz"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
-                        TORA_HOME=str(self.home), FIXTURE=str(self.fixture))
+                        TORA_HOME=str(self.home), FIXTURE=str(self.fixture),
+                        HOME=str(self.root / "shell-home"), SHELL="/bin/bash", LC_ALL="C")
+        self.env.pop("ZDOTDIR", None)
         self.env.pop("TORA_VERSION", None)
         self.tool("uname", '#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo x86_64;; esac\n')
         self.tool("curl", '''#!/usr/bin/env python3
@@ -89,6 +91,95 @@ else:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(subprocess.check_output([self.installed(), "--version"], text=True), "tora 0.1.0\n")
             self.assertFalse((self.home / "update.lock").exists())
+
+    def test_bash_path_is_persistent_and_idempotent(self):
+        for _ in range(2):
+            self.assertEqual(self.run_install().returncode, 0)
+        for name in (".bashrc", ".bash_profile"):
+            path = Path(self.env["HOME"]) / name
+            self.assertEqual(path.read_text().count("# >>> tora PATH >>>"), 1)
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-c",
+                                     'source "$1"; source "$1"; command -v tora; printf "%s" "$TORA_HOME"',
+                                     "bash", str(path)], env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, f"{self.installed()}\n{self.home}")
+
+    def test_default_home_and_existing_path_are_persisted(self):
+        self.env.pop("TORA_HOME")
+        self.home = Path(self.env["HOME"]) / ".tora"
+        self.env["PATH"] = f"{self.home / 'bin'}:{self.env['PATH']}"
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.installed().exists())
+        self.assertIn("# >>> tora PATH >>>", (Path(self.env["HOME"]) / ".bashrc").read_text())
+
+    def test_zsh_uses_zdotdir_and_preserves_existing_content(self):
+        self.env["SHELL"] = "/bin/zsh"
+        directory = self.root / "zsh config"
+        directory.mkdir()
+        self.env["ZDOTDIR"] = str(directory)
+        path = directory / ".zshrc"
+        path.write_text("# existing config\nexport KEEP_ME=yes\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertTrue(path.read_text().startswith("# existing config\nexport KEEP_ME=yes\n"))
+        self.assertFalse((Path(self.env["HOME"]) / ".bashrc").exists())
+        if shutil.which("zsh"):
+            result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; command -v tora', "zsh", str(path)],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), str(self.installed()))
+
+    def test_custom_path_is_quoted_and_replaced_on_reinstall(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        self.home = self.root / "custom '$(touch injected) `touch injected`"
+        self.env["TORA_HOME"] = str(self.home)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = Path(self.env["HOME"]) / ".bashrc"
+        self.assertEqual(path.read_text().count("# >>> tora PATH >>>"), 1)
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", 'source "$1"; command -v tora',
+                                 "bash", str(path)], env=self.env, cwd=self.root, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.installed()))
+        self.assertFalse((self.root / "injected").exists())
+
+    def test_bash_keeps_login_choice_and_dotfile_symlink(self):
+        home = Path(self.env["HOME"])
+        home.mkdir()
+        target = self.root / "dotfile"
+        target.write_text("# preserved\n")
+        (home / ".bashrc").symlink_to(target)
+        (home / ".profile").write_text("# login\n")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertTrue((home / ".bashrc").is_symlink())
+        self.assertTrue(target.read_text().startswith("# preserved\n"))
+        self.assertIn("# >>> tora PATH >>>", (home / ".profile").read_text())
+        self.assertFalse((home / ".bash_profile").exists())
+
+    def test_failed_verification_does_not_modify_shell_files(self):
+        (self.fixture / self.asset).write_bytes(b"corrupt")
+        self.assertNotEqual(self.run_install().returncode, 0)
+        self.assertFalse(Path(self.env["HOME"]).exists())
+
+    def test_damaged_markers_and_unsupported_shell_give_manual_guidance(self):
+        home = Path(self.env["HOME"])
+        home.mkdir()
+        path = home / ".bashrc"
+        original = "# >>> tora PATH >>>\nunfinished\n"
+        path.write_text(original)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PATH setup needs attention", result.stderr)
+        self.assertEqual(path.read_text(), original)
+        self.assertFalse((home / ".bash_profile").exists())
+        self.env["SHELL"] = "/bin/fish"
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("supports Bash/Zsh", result.stderr)
+        self.assertEqual(path.read_text(), original)
+        self.env["SHELL"] = ""
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("PATH setup needs attention", result.stderr)
 
     def test_invalid_version_and_unknown_arguments(self):
         for args in [("--version",), ("--bad",), ("--version", "v1.2.3/../../x"),
