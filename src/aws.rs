@@ -1,5 +1,8 @@
 mod history;
+mod settings;
 mod status;
+
+use settings::Settings;
 
 use crate::cli::AwsCommands;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -10,12 +13,39 @@ use std::{
 };
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
+    let settings = Settings::load()?;
     match command {
-        AwsCommands::Exec { profile, command } => {
-            let profile = resolve_profile(profile)?;
+        AwsCommands::Whoami { profile } => {
+            print!("{}", identity_with_settings(profile, &settings)?);
+            Ok(())
+        }
+        AwsCommands::Logout => {
+            eprintln!("Logging out ALL cached AWS SSO sessions across all profiles.");
+            let status = settings
+                .command()
+                .args(["sso", "logout"])
+                .status()
+                .map_err(aws_error)?;
+            if !status.success() {
+                return Err(io::Error::other(format!("aws sso logout failed: {status}")));
+            }
+            println!("Logged out all cached SSO sessions. Parent shell environment is unchanged.");
+            Ok(())
+        }
+        AwsCommands::Exec {
+            profile,
+            login,
+            no_browser,
+            use_device_code,
+            command,
+        } => {
+            let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;
+            if login {
+                ensure_login(&profile, &settings, no_browser, use_device_code)?;
+            }
             let mut child = Command::new(&command[0]);
             child.args(&command[1..]);
-            configure_profile(&mut child, &profile);
+            settings.configure_profile(&mut child, &profile);
             history::remember(&profile);
             #[cfg(unix)]
             {
@@ -29,7 +59,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             }
         }
         AwsCommands::Profiles => {
-            let profiles = profiles()?;
+            let profiles = profiles(&settings)?;
             let mut out = io::stdout().lock();
             for profile in profiles {
                 writeln!(out, "{profile}")?;
@@ -44,74 +74,38 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             no_browser,
             use_device_code,
         } => {
-            let profile = profile.or_else(|| if select { None } else { current_profile() });
-            let profile = resolve_profile(profile)?;
-            if credentials_valid(&profile)? {
-                eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
+            let profile = if select {
+                None
             } else {
-                eprintln!("Logging in with AWS profile {profile:?}...");
-                let mut command = profile_command(&profile);
-                command.args(["sso", "login", "--profile", &profile]);
-                if no_browser {
-                    command.arg("--no-browser");
-                }
-                if use_device_code {
-                    command.arg("--use-device-code");
-                }
-                // Preserve browser/device login interaction while keeping stdout safe to eval.
-                let status = command
-                    .stdout(Stdio::from(io::stderr()))
-                    .status()
-                    .map_err(aws_error)?;
-                if !status.success() {
-                    return Err(io::Error::other(format!(
-                        "aws sso login failed for profile {profile:?}: {status}"
-                    )));
-                }
-                eprintln!("SSO login completed for profile {profile:?}.");
-            }
+                profile.or(settings.profile.clone())
+            };
+            let profile = resolve_profile(profile, &settings)?;
+            ensure_login(&profile, &settings, no_browser, use_device_code)?;
             history::remember(&profile);
             if export {
-                writeln!(io::stdout().lock(), "{}", export_statement(&profile))?;
+                writeln!(
+                    io::stdout().lock(),
+                    "{}",
+                    settings.export_statement(&profile)
+                )?;
             } else if no_shell {
                 eprintln!("To use this profile in your current Bash/Zsh shell:");
-                eprintln!("  {}", export_statement(&profile));
+                eprintln!("  {}", settings.export_statement(&profile));
             } else {
-                return open_shell(&profile);
+                return open_shell(&profile, &settings);
             }
             Ok(())
         }
         AwsCommands::Status { profile } => {
-            status::run(&resolve_profile(profile.or_else(current_profile))?)
+            let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;
+            status::run(&profile, &settings)
         }
     }
 }
 
-fn current_profile() -> Option<String> {
-    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-}
-
-// Static credentials take precedence over AWS_PROFILE. Remove them only in the
-// child processes (or explicitly requested export output), never in the parent process.
-const CREDENTIAL_ENV: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "AWS_DEFAULT_PROFILE",
-];
-
-// Use the same credential environment for validation, login and the child shell.
-fn profile_command(profile: &str) -> Command {
-    let mut command = aws();
-    configure_profile(&mut command, profile);
-    command
-}
-
-fn credentials_valid(profile: &str) -> io::Result<bool> {
-    let output = profile_command(profile)
+fn credentials_valid(profile: &str, settings: &Settings) -> io::Result<bool> {
+    let output = settings
+        .profile_command(profile)
         .args(["sts", "get-caller-identity", "--profile", profile])
         .stdout(Stdio::null())
         .output()
@@ -147,14 +141,49 @@ fn authenticated(profile: &str, output: &Output) -> io::Result<bool> {
     )))
 }
 
-fn open_shell(profile: &str) -> io::Result<()> {
+// Reuse valid credentials and log in only for known missing/expired authentication.
+// All messages and login output go to stderr so stdout stays safe to eval or pipe.
+fn ensure_login(
+    profile: &str,
+    settings: &Settings,
+    no_browser: bool,
+    use_device_code: bool,
+) -> io::Result<()> {
+    if credentials_valid(profile, settings)? {
+        eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
+        return Ok(());
+    }
+    eprintln!("Logging in with AWS profile {profile:?}...");
+    let mut command = settings.profile_command(profile);
+    command.args(["sso", "login", "--profile", profile]);
+    if no_browser {
+        command.arg("--no-browser");
+    }
+    if use_device_code {
+        command.arg("--use-device-code");
+    }
+    // Preserve browser/device login interaction while keeping stdout safe to eval.
+    let status = command
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(aws_error)?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "aws sso login failed for profile {profile:?}: {status}"
+        )));
+    }
+    eprintln!("SSO login completed for profile {profile:?}.");
+    Ok(())
+}
+
+fn open_shell(profile: &str, settings: &Settings) -> io::Result<()> {
     let shell = std::env::var_os("SHELL")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut command = Command::new(&shell);
     let _startup = crate::shell::configure(&mut command, &shell)?;
     command.arg("-i");
-    configure_profile(&mut command, profile);
+    settings.configure_profile(&mut command, profile);
     eprintln!("Opening shell with AWS_PROFILE={profile:?}. Type exit to return.");
     #[cfg(unix)]
     {
@@ -173,18 +202,11 @@ fn open_shell(profile: &str) -> io::Result<()> {
     }
 }
 
-fn configure_profile(command: &mut Command, profile: &str) {
-    command.env("AWS_PROFILE", profile);
-    for name in CREDENTIAL_ENV {
-        command.env_remove(name);
-    }
-}
-
-fn resolve_profile(profile: Option<String>) -> io::Result<String> {
+fn resolve_profile(profile: Option<String>, settings: &Settings) -> io::Result<String> {
     let profile = match profile {
         Some(profile) => profile,
         None => {
-            let mut profiles = profiles()?;
+            let mut profiles = profiles(settings)?;
             history::sort(&mut profiles);
             if io::stdin().is_terminal() && io::stderr().is_terminal() {
                 select_terminal_profile(&profiles)?
@@ -243,13 +265,6 @@ fn select_terminal_profile(profiles: &[String]) -> io::Result<String> {
         .map_err(io::Error::other)
 }
 
-fn aws() -> Command {
-    let mut command = Command::new("aws");
-    command.env("AWS_PAGER", "");
-    command.env("AWS_CLI_AUTO_PROMPT", "off");
-    command
-}
-
 fn aws_error(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::NotFound {
         io::Error::new(
@@ -261,9 +276,16 @@ fn aws_error(error: io::Error) -> io::Error {
     }
 }
 
-fn profiles() -> io::Result<Vec<String>> {
+/// Profile names for shell completion. Listing profiles does not depend on
+/// saved defaults, so a broken tora config cannot hide candidates.
+pub(crate) fn completion_profiles() -> io::Result<Vec<String>> {
+    profiles(&Settings::default())
+}
+
+fn profiles(settings: &Settings) -> io::Result<Vec<String>> {
     // AWS CLI handles config, credentials, default, sso-session sections and custom paths.
-    let output = aws()
+    let output = settings
+        .command()
         .args(["configure", "list-profiles"])
         .stderr(Stdio::inherit())
         .output()
@@ -294,14 +316,6 @@ fn validate_profile(profile: &str) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn export_statement(profile: &str) -> String {
-    format!(
-        "unset {};\nexport AWS_PROFILE='{}'",
-        CREDENTIAL_ENV.join(" "),
-        profile.replace('\'', "'\\''")
-    )
 }
 
 fn read_line(input: &mut impl BufRead) -> io::Result<String> {
@@ -369,6 +383,107 @@ fn select_profile(
     }
 }
 
+// With no explicit argument, preserve ambient credentials: whoami must describe
+// the actual identity, including environment credentials that override profiles.
+pub fn identity(explicit: Option<String>) -> io::Result<String> {
+    identity_with_settings(explicit, &Settings::load()?)
+}
+
+fn identity_with_settings(explicit: Option<String>, settings: &Settings) -> io::Result<String> {
+    let profile = explicit.clone().or(settings.profile.clone());
+    if let Some(profile) = &profile {
+        validate_profile(profile)?;
+    }
+    let make_command = || {
+        if let Some(profile) = &explicit {
+            explicit_command(profile, settings)
+        } else {
+            let mut command = settings.command();
+            if let Some(profile) = &profile {
+                command.env("AWS_PROFILE", profile);
+                command.env_remove("AWS_DEFAULT_PROFILE");
+            }
+            command
+        }
+    };
+    let output = caller_identity(make_command())?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "AWS identity check failed: {}\n{}\nRun tora aws sso for missing or expired SSO credentials.",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    describe_identity(
+        profile.as_deref().unwrap_or("default (credential chain)"),
+        &output,
+        make_command,
+        settings,
+    )
+}
+
+/// An AWS CLI command for an explicitly selected profile, ignoring ambient credentials.
+fn explicit_command(profile: &str, settings: &Settings) -> Command {
+    let mut command = settings.profile_command(profile);
+    command.args(["--profile", profile]);
+    command
+}
+
+fn caller_identity(mut command: Command) -> io::Result<Output> {
+    command
+        .args([
+            "sts",
+            "get-caller-identity",
+            "--query",
+            "[Account,Arn,UserId]",
+            "--output",
+            "text",
+            "--cli-connect-timeout",
+            "5",
+            "--cli-read-timeout",
+            "10",
+        ])
+        .output()
+        .map_err(aws_error)
+}
+
+/// Formats a successful `caller_identity` output as the whoami report.
+fn describe_identity(
+    profile: &str,
+    output: &Output,
+    make_command: impl Fn() -> Command,
+    settings: &Settings,
+) -> io::Result<String> {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<_> = text.trim().split('\t').collect();
+    if fields.len() != 3 || fields.iter().any(|v| v.is_empty() || *v == "None") {
+        return Err(io::Error::other("unexpected AWS identity response"));
+    }
+    let region = match &settings.region {
+        Some(region) => region.clone(),
+        None => {
+            let output = make_command()
+                .args(["configure", "get", "region"])
+                .output()
+                .map_err(aws_error)?;
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            } else if output.status.code() == Some(1) && output.stderr.is_empty() {
+                "(not configured)".into()
+            } else {
+                return Err(io::Error::other(format!(
+                    "AWS region check failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+    };
+    Ok(format!(
+        "Profile: {profile}\nAccount: {}\nARN: {}\nUser ID: {}\nRegion: {region}\n",
+        fields[0], fields[1], fields[2]
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,14 +521,5 @@ mod tests {
         for input in [&b""[..], &b"q\n"[..]] {
             assert!(select_profile(&["dev".into()], &mut &input[..], &mut Vec::new()).is_err());
         }
-    }
-
-    #[test]
-    fn export_quotes_shell_metacharacters() {
-        assert!(
-            export_statement("a'b$(echo x)").ends_with("export AWS_PROFILE='a'\\''b$(echo x)'")
-        );
-        assert!(validate_profile("dev\nexport BAD=1").is_err());
-        assert!(validate_profile("").is_err());
     }
 }

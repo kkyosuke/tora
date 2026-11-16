@@ -1,3 +1,4 @@
+use super::Settings;
 use std::{
     fs,
     io::{self, Read, Write},
@@ -9,38 +10,30 @@ use std::{
 // Token cache files are small; never read unbounded data from the cache directory.
 const MAX_BYTES: u64 = 64 * 1024;
 
-pub(super) fn run(profile: &str) -> io::Result<()> {
-    let output = super::profile_command(profile)
-        .args(["sts", "get-caller-identity", "--profile", profile])
-        .args(["--query", "[Account,Arn]", "--output", "text"])
-        .output()
-        .map_err(super::aws_error)?;
-    let authenticated = super::authenticated(profile, &output)?;
+/// `whoami` for the selected profile plus the SSO token expiry. Never logs in.
+pub(super) fn run(profile: &str, settings: &Settings) -> io::Result<()> {
+    let make_command = || super::explicit_command(profile, settings);
+    let output = super::caller_identity(make_command())?;
+    let report = if super::authenticated(profile, &output)? {
+        Some(super::describe_identity(
+            profile,
+            &output,
+            make_command,
+            settings,
+        )?)
+    } else {
+        None
+    };
     // Read the cache after the check: AWS CLI may have refreshed the token.
-    let expiry = sso_expiry(profile);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let expiry = describe_expiry(sso_expiry(profile, settings).as_ref(), now());
 
     let mut out = io::stdout().lock();
-    writeln!(out, "Profile:     {profile}")?;
-    if authenticated {
-        let identity = String::from_utf8_lossy(&output.stdout);
-        let mut fields = identity.split_whitespace().map(printable);
-        let account = fields.next().unwrap_or_else(|| "unknown".into());
-        let arn = fields.next().unwrap_or_else(|| "unknown".into());
-        writeln!(out, "Account:     {account}")?;
-        writeln!(out, "Arn:         {arn}")?;
-        if let Some(role) = role_name(&arn) {
-            writeln!(out, "Role:        {role}")?;
-        }
+    match &report {
+        Some(report) => write!(out, "{report}")?,
+        None => writeln!(out, "Profile: {profile}")?,
     }
-    writeln!(
-        out,
-        "SSO expires: {}",
-        describe_expiry(expiry.as_ref(), now)
-    )?;
-    if authenticated {
+    writeln!(out, "SSO expires: {expiry}")?;
+    if report.is_some() {
         return Ok(());
     }
     // Only echo names that are safe to paste into a shell.
@@ -54,6 +47,12 @@ pub(super) fn run(profile: &str) -> io::Result<()> {
         "not logged in or the session has expired for profile {profile:?}; \
          run `tora aws sso{argument}` to log in"
     )))
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 struct Expiry {
@@ -88,28 +87,13 @@ fn duration(seconds: i64) -> String {
     }
 }
 
-fn role_name(arn: &str) -> Option<&str> {
-    let resource = arn.splitn(6, ':').nth(5)?;
-    let mut parts = resource.split('/');
-    match parts.next()? {
-        "assumed-role" => parts.next(),
-        "role" => parts.next_back(),
-        _ => None,
-    }
-    .filter(|role| !role.is_empty())
-}
-
-fn printable(value: &str) -> String {
-    value.chars().filter(|c| !c.is_control()).collect()
-}
-
 /// Any failure means "unknown": the status command must not fail because the
 /// cache is missing, unreadable or in an unexpected format.
-fn sso_expiry(profile: &str) -> Option<Expiry> {
+fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
     // AWS CLI names the token cache after the sso-session name, or after the
     // start URL for legacy profiles without an sso-session.
-    let key =
-        configured(profile, "sso_session").or_else(|| configured(profile, "sso_start_url"))?;
+    let key = configured(profile, settings, "sso_session")
+        .or_else(|| configured(profile, settings, "sso_start_url"))?;
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
     let path = PathBuf::from(home)
         .join(".aws/sso/cache")
@@ -133,9 +117,9 @@ fn sso_expiry(profile: &str) -> Option<Expiry> {
     })
 }
 
-fn configured(profile: &str, name: &str) -> Option<String> {
-    let output = super::profile_command(profile)
-        .args(["configure", "get", name, "--profile", profile])
+fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> {
+    let output = super::explicit_command(profile, settings)
+        .args(["configure", "get", name])
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -342,19 +326,5 @@ mod tests {
             describe_expiry(Some(&expiry(100, true)), 100),
             "T (expired)"
         );
-    }
-
-    #[test]
-    fn role_name_is_extracted_from_role_arns() {
-        assert_eq!(
-            role_name("arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_0123/alice"),
-            Some("AWSReservedSSO_Admin_0123")
-        );
-        assert_eq!(
-            role_name("arn:aws:iam::123456789012:role/path/Deploy"),
-            Some("Deploy")
-        );
-        assert_eq!(role_name("arn:aws:iam::123456789012:user/alice"), None);
-        assert_eq!(role_name("unknown"), None);
     }
 }
