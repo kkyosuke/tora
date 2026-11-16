@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -25,8 +27,120 @@ pub fn run(command: CompletionCommand) -> io::Result<()> {
         Elvish => clap_complete::Shell::Elvish,
         Install { shell, path, yes } => return install(shell, path, yes),
     };
-    clap_complete::generate(shell, &mut Cli::command(), "tora", &mut io::stdout());
-    Ok(())
+    let mut out = io::stdout().lock();
+    clap_complete::generate(shell, &mut Cli::command(), "tora", &mut out);
+    // The generated scripts are static. Bash and Zsh get a wrapper that asks
+    // this binary for AWS profile names and otherwise defers to them.
+    match shell {
+        clap_complete::Shell::Bash => out.write_all(BASH_PROFILES.as_bytes()),
+        clap_complete::Shell::Zsh => out.write_all(ZSH_PROFILES.as_bytes()),
+        _ => Ok(()),
+    }
+}
+
+// Profile names are data: never let the shell expand or word-split them.
+const BASH_PROFILES: &str = r#"
+_tora_dynamic() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" profile
+    if [[ $cur != -* ]]; then
+        COMPREPLY=()
+        while IFS= read -r profile; do
+            if [[ -n $profile && $profile == "$cur"* ]]; then
+                printf -v profile %q "$profile"
+                COMPREPLY+=("$profile")
+            fi
+        done < <(command tora __complete-aws-profiles -- "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)
+        [[ ${#COMPREPLY[@]} -gt 0 ]] && return 0
+    fi
+    _tora "$@"
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _tora_dynamic -o nosort -o bashdefault -o default tora
+else
+    complete -F _tora_dynamic -o bashdefault -o default tora
+fi
+"#;
+
+const ZSH_PROFILES: &str = r#"
+_tora_dynamic() {
+    if [[ ${words[CURRENT]} != -* ]]; then
+        local -a profiles
+        local expl
+        profiles=("${(@f)$(command tora __complete-aws-profiles -- "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
+        profiles=("${(@)profiles:#}")
+        if (( $#profiles )); then
+            _wanted profiles expl 'AWS profile' compadd -a profiles
+            return
+        fi
+    fi
+    _tora "$@"
+}
+
+compdef _tora_dynamic tora
+"#;
+
+/// Whether the word after `words` is a positional argument named `profile`.
+fn completes_profile(words: &[OsString]) -> bool {
+    let mut root = Cli::command();
+    root.build();
+    let mut command = &root;
+    let mut positionals = 0;
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        let Some(word) = word.to_str() else {
+            return false;
+        };
+        if word == "--" {
+            // Everything after the escape belongs to the wrapped command.
+            return false;
+        }
+        let option = match word.strip_prefix("--") {
+            Some(long) => command
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some(long)),
+            None if word.len() > 1 && word.starts_with('-') => command
+                .get_arguments()
+                .find(|arg| arg.get_short() == word.chars().last()),
+            None => {
+                match command.find_subcommand(word) {
+                    Some(subcommand) if positionals == 0 => command = subcommand,
+                    _ => positionals += 1,
+                }
+                continue;
+            }
+        };
+        // An option's separate value is not a positional argument.
+        if option.is_some_and(|arg| arg.get_action().takes_values()) {
+            words.next();
+        }
+    }
+    command
+        .get_positionals()
+        .nth(positionals)
+        .is_some_and(|arg| arg.get_id() == "profile")
+}
+
+/// Answers the request the generated Bash/Zsh wrappers make on Tab:
+/// `tora __complete-aws-profiles -- <words before the cursor>`.
+/// It is not a clap subcommand, so it stays out of help and static completions.
+pub fn answer_profile_request() -> bool {
+    let mut args = env::args_os().skip(1);
+    if args.next().as_deref() != Some("__complete-aws-profiles".as_ref()) {
+        return false;
+    }
+    let words: Vec<_> = args.skip(1).collect();
+    // Completion must stay quiet: a missing or failing AWS CLI means no candidates.
+    if completes_profile(&words) {
+        if let Ok(profiles) = crate::aws::profiles() {
+            let mut out = io::stdout().lock();
+            for profile in profiles {
+                // A closed pipe only means the shell stopped listening.
+                let _ = writeln!(out, "{profile}");
+            }
+        }
+    }
+    true
 }
 
 impl InstallShell {
@@ -462,6 +576,37 @@ mod tests {
         assert_eq!(shell_name("-bash"), Some(InstallShell::Bash));
         assert_eq!(shell_name("fish"), None);
         assert_eq!(shell_name("bash-helper"), None);
+    }
+
+    #[test]
+    fn completes_profiles_only_at_profile_positionals() {
+        let at = |words: &[&str]| {
+            completes_profile(&words.iter().map(OsString::from).collect::<Vec<_>>())
+        };
+        for words in [
+            &["aws", "sso"][..],
+            &["aws", "exec"],
+            &["aws", "sso", "--no-browser"],
+            &["aws", "sso", "--no-shell", "--use-device-code"],
+        ] {
+            assert!(at(words), "{words:?}");
+        }
+        for words in [
+            &[][..],
+            &["aws"],
+            &["aws", "profiles"],
+            &["aws", "sso", "dev"],
+            &["aws", "exec", "dev"],
+            &["aws", "exec", "--"],
+            &["aws", "exec", "dev", "--"],
+            &["aws", "exec", "dev", "--", "aws", "sso"],
+            &["aws", "help"],
+            &["help", "aws", "sso"],
+            &["update", "--version"],
+            &["completion", "install", "--path"],
+        ] {
+            assert!(!at(words), "{words:?}");
+        }
     }
 
     #[test]

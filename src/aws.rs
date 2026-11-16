@@ -254,7 +254,7 @@ fn aws_error(error: io::Error) -> io::Error {
     }
 }
 
-fn profiles() -> io::Result<Vec<String>> {
+pub(crate) fn profiles() -> io::Result<Vec<String>> {
     // AWS CLI handles config, credentials, default, sso-session sections and custom paths.
     let output = aws()
         .args(["configure", "list-profiles"])

@@ -8,6 +8,9 @@ use cli::{Cli, Commands};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if completion::answer_profile_request() {
+        return ExitCode::SUCCESS;
+    }
     let result = match Cli::parse().command {
         Commands::Aws { command } => aws::run(command),
         Commands::Update { version } => update::run(version.as_deref()),
