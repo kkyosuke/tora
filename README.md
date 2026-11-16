@@ -33,7 +33,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | 今の認証状態を確認する | `tora aws status` | `whoami` の内容に SSO 期限の残り時間を加えて表示 |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
 | 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
-| 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証を診断 |
+| 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証・SSO 期限を診断 |
 | AWS の実際の接続先を確認する | `tora aws whoami` | アカウント・ARN・リージョンを表示 |
 | SSO セッションを終了する | `tora aws logout` | 全プロファイルの SSO キャッシュをログアウト |
 | 既定値を保存する | `tora config set aws.profile dev` | プロファイル・リージョンを設定 |
@@ -152,6 +152,8 @@ tora config unset aws.region
 Bash/Zsh の補完設定、AWS CLI v2、STS による実際の認証状態を確認します。
 問題があっても残りの診断を続け、すべて正常なら終了コード0、要対応なら1を返します。
 自動修復・SSO ログインは行いません。AWS CLI 自身の認証情報の更新は通常どおり行われます。
+`--profile` または既定のプロファイル（環境変数・`aws.profile`）があれば、`tora aws status` と同じ方法で
+SSO トークンの期限と残り時間も表示します。期限切れは要対応として扱い、判定できない場合は SKIP として扱います。
 補完は `tora completion install` が保存したカスタムパスにも対応します。
 親シェルが補完を読み込み済みか、手動の補完設定が有効かは判定できません。
 

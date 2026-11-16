@@ -36,6 +36,27 @@ pub(super) fn run(profile: &str, settings: &Settings) -> io::Result<()> {
     if report.is_some() {
         return Ok(());
     }
+    Err(io::Error::other(format!(
+        "not logged in or the session has expired for profile {profile:?}; {}",
+        login_hint(profile)
+    )))
+}
+
+/// The SSO token expiry for doctor: Ok(None) when it cannot be determined,
+/// an error when the token has already expired.
+pub(super) fn expiry(profile: &str, settings: &Settings) -> io::Result<Option<String>> {
+    let Some(expiry) = sso_expiry(profile, settings) else {
+        return Ok(None);
+    };
+    let now = now();
+    let text = format!("{profile}: {}", describe_expiry(Some(&expiry), now));
+    if expiry.epoch <= now {
+        return Err(io::Error::other(format!("{text}; {}", login_hint(profile))));
+    }
+    Ok(Some(text))
+}
+
+fn login_hint(profile: &str) -> String {
     // Only echo names that are safe to paste into a shell.
     let safe = |c: char| c.is_ascii_alphanumeric() || "_.-@".contains(c);
     let argument = if profile.chars().all(safe) && !profile.starts_with('-') {
@@ -43,10 +64,7 @@ pub(super) fn run(profile: &str, settings: &Settings) -> io::Result<()> {
     } else {
         String::new()
     };
-    Err(io::Error::other(format!(
-        "not logged in or the session has expired for profile {profile:?}; \
-         run `tora aws sso{argument}` to log in"
-    )))
+    format!("run `tora aws sso{argument}` to log in")
 }
 
 fn now() -> i64 {

@@ -119,11 +119,22 @@ pub fn run(profile: Option<String>) -> io::Result<()> {
     if has_cli {
         report(
             "AWS authentication / SSO",
-            crate::aws::identity(profile),
+            crate::aws::identity(profile.clone()),
             &mut failures,
         );
+        match crate::aws::sso_expiry(profile) {
+            Ok(None) => println!(
+                "[SKIP] AWS SSO expiry: unknown (no profile selected, not an SSO profile or no cached token)"
+            ),
+            result => report(
+                "AWS SSO expiry",
+                result.map(Option::unwrap_or_default),
+                &mut failures,
+            ),
+        }
     } else {
         println!("[SKIP] AWS authentication / SSO: AWS CLI v2 is required");
+        println!("[SKIP] AWS SSO expiry: AWS CLI v2 is required");
     }
     if failures == 0 {
         println!("All checks passed.");
