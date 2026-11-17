@@ -117,11 +117,15 @@ pub fn run(profile: Option<String>) -> io::Result<()> {
     let has_cli = cli.is_ok();
     report("AWS CLI", cli, &mut failures);
     if has_cli {
-        report(
-            "AWS authentication / SSO",
-            crate::aws::identity(profile),
-            &mut failures,
-        );
+        // One result for both: a failed identity check already explains the
+        // expired session, so the expiry is only checked after it succeeds.
+        let auth = crate::aws::identity(profile.clone()).and_then(|identity| {
+            Ok(match crate::aws::sso_expiry(profile)? {
+                Some(expiry) => format!("{identity}SSO expires: {expiry}"),
+                None => identity,
+            })
+        });
+        report("AWS authentication / SSO", auth, &mut failures);
     } else {
         println!("[SKIP] AWS authentication / SSO: AWS CLI v2 is required");
     }

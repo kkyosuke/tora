@@ -27,7 +27,12 @@ case "$1 $2" in
   'sts get-caller-identity')
     if [ -n "$TEST_AUTH_ERROR" ]; then printf '%s\n' "$TEST_AUTH_ERROR" >&2; exit 1; fi
     printf '123456789012\tarn:aws:sts::123456789012:assumed-role/Developer/session\tUSER:session\n';;
-  'configure get') printf '%s\n' "${TEST_REGION:-ap-northeast-1}"; exit "${TEST_REGION_STATUS:-0}";;
+  'configure get')
+    case "$3" in
+      sso_session) [ -n "$TEST_SSO_SESSION" ] || exit 1; printf '%s\n' "$TEST_SSO_SESSION"; exit 0;;
+      sso_start_url) exit 1;;
+    esac
+    printf '%s\n' "${TEST_REGION:-ap-northeast-1}"; exit "${TEST_REGION_STATUS:-0}";;
   'configure list-profiles') printf 'default\ndev\n';;
   'sso logout') exit "${TEST_LOGOUT_STATUS:-0}";;
   'sso login') printf 'login output\n'; exit "${TEST_LOGIN_STATUS:-0}";;
@@ -433,6 +438,64 @@ fn doctor_aggregates_failures_without_installing_or_logging_in() {
             .unwrap()
             .contains("login")
     );
+}
+
+#[test]
+fn doctor_reports_sso_expiry_in_the_authentication_check() {
+    let f = Fixture::new();
+    let cache = f.path(".aws/sso/cache");
+    fs::create_dir_all(&cache).unwrap();
+    // SHA-1 of the sso-session name "abc", as AWS CLI names the token cache.
+    let token = cache.join("a9993e364706816aba3e25717850c26c9cd0d89d.json");
+    let doctor = |args: &[&str]| {
+        let out = f
+            .command(args)
+            .env("TEST_SSO_SESSION", "abc")
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        // Authentication and SSO expiry are one check, never two results.
+        assert_eq!(
+            text.matches("AWS authentication / SSO").count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("secret"));
+        text
+    };
+
+    fs::write(
+        &token,
+        r#"{"accessToken": "secret", "expiresAt": "2099-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let text = doctor(&["doctor", "--profile", "dev"]);
+    assert!(text.contains("[OK] AWS authentication / SSO: Profile: dev\n"));
+    assert!(
+        text.contains("Region: ap-northeast-1\nSSO expires: 2099-01-01T00:00:00Z ("),
+        "{text}"
+    );
+    // Without a selected profile the expiry cannot be attributed to one.
+    assert!(!doctor(&["doctor"]).contains("SSO expires"));
+
+    fs::write(
+        &token,
+        r#"{"accessToken": "secret", "expiresAt": "2000-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let text = doctor(&["doctor", "--profile", "dev"]);
+    assert!(
+        text.contains(
+            "[WARN] AWS authentication / SSO: SSO token for profile \"dev\" expires: \
+             2000-01-01T00:00:00Z (expired); run `tora aws sso dev` to log in"
+        ),
+        "{text}"
+    );
+
+    fs::remove_file(&token).unwrap();
+    let text = doctor(&["doctor", "--profile", "dev"]);
+    assert!(text.contains("[OK] AWS authentication / SSO: Profile: dev\n"));
+    assert!(text.contains("SSO expires: unknown\n"), "{text}");
 }
 
 #[test]

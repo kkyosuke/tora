@@ -1,5 +1,6 @@
 mod history;
 mod settings;
+mod status;
 
 use settings::Settings;
 
@@ -8,7 +9,7 @@ use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::{
     collections::HashSet,
     io::{self, BufRead, IsTerminal, Write},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
@@ -95,6 +96,10 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             }
             Ok(())
         }
+        AwsCommands::Status { profile } => {
+            let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;
+            status::run(&profile, &settings)
+        }
     }
 }
 
@@ -105,6 +110,11 @@ fn credentials_valid(profile: &str, settings: &Settings) -> io::Result<bool> {
         .stdout(Stdio::null())
         .output()
         .map_err(aws_error)?;
+    authenticated(profile, &output)
+}
+
+// Ok(false) means a login is needed; unrelated failures are reported as errors.
+fn authenticated(profile: &str, output: &Output) -> io::Result<bool> {
     if output.status.success() {
         return Ok(true);
     }
@@ -373,6 +383,17 @@ fn select_profile(
     }
 }
 
+/// SSO token expiry of the explicit or default profile, for doctor.
+/// Ok(None) when no profile is selected; an error when the token has expired.
+pub fn sso_expiry(explicit: Option<String>) -> io::Result<Option<String>> {
+    let settings = Settings::load()?;
+    let Some(profile) = explicit.or(settings.profile.clone()) else {
+        return Ok(None);
+    };
+    validate_profile(&profile)?;
+    status::expiry(&profile, &settings).map(Some)
+}
+
 // With no explicit argument, preserve ambient credentials: whoami must describe
 // the actual identity, including environment credentials that override profiles.
 pub fn identity(explicit: Option<String>) -> io::Result<String> {
@@ -386,9 +407,7 @@ fn identity_with_settings(explicit: Option<String>, settings: &Settings) -> io::
     }
     let make_command = || {
         if let Some(profile) = &explicit {
-            let mut command = settings.profile_command(profile);
-            command.args(["--profile", profile]);
-            command
+            explicit_command(profile, settings)
         } else {
             let mut command = settings.command();
             if let Some(profile) = &profile {
@@ -398,7 +417,31 @@ fn identity_with_settings(explicit: Option<String>, settings: &Settings) -> io::
             command
         }
     };
-    let output = make_command()
+    let output = caller_identity(make_command())?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "AWS identity check failed: {}\n{}\nRun tora aws sso for missing or expired SSO credentials.",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    describe_identity(
+        profile.as_deref().unwrap_or("default (credential chain)"),
+        &output,
+        make_command,
+        settings,
+    )
+}
+
+/// An AWS CLI command for an explicitly selected profile, ignoring ambient credentials.
+fn explicit_command(profile: &str, settings: &Settings) -> Command {
+    let mut command = settings.profile_command(profile);
+    command.args(["--profile", profile]);
+    command
+}
+
+fn caller_identity(mut command: Command) -> io::Result<Output> {
+    command
         .args([
             "sts",
             "get-caller-identity",
@@ -412,14 +455,16 @@ fn identity_with_settings(explicit: Option<String>, settings: &Settings) -> io::
             "10",
         ])
         .output()
-        .map_err(aws_error)?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "AWS identity check failed: {}\n{}\nRun tora aws sso for missing or expired SSO credentials.",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
+        .map_err(aws_error)
+}
+
+/// Formats a successful `caller_identity` output as the whoami report.
+fn describe_identity(
+    profile: &str,
+    output: &Output,
+    make_command: impl Fn() -> Command,
+    settings: &Settings,
+) -> io::Result<String> {
     let text = String::from_utf8_lossy(&output.stdout);
     let fields: Vec<_> = text.trim().split('\t').collect();
     if fields.len() != 3 || fields.iter().any(|v| v.is_empty() || *v == "None") {
@@ -445,11 +490,8 @@ fn identity_with_settings(explicit: Option<String>, settings: &Settings) -> io::
         }
     };
     Ok(format!(
-        "Profile: {}\nAccount: {}\nARN: {}\nUser ID: {}\nRegion: {region}\n",
-        profile.as_deref().unwrap_or("default (credential chain)"),
-        fields[0],
-        fields[1],
-        fields[2]
+        "Profile: {profile}\nAccount: {}\nARN: {}\nUser ID: {}\nRegion: {region}\n",
+        fields[0], fields[1], fields[2]
     ))
 }
 

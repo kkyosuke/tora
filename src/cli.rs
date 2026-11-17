@@ -141,6 +141,11 @@ pub enum AwsCommands {
         #[arg(long)]
         use_device_code: bool,
     },
+    /// Show whoami for a profile plus its SSO token expiry (does not log in)
+    Status {
+        /// Profile name; defaults to AWS_PROFILE, AWS_DEFAULT_PROFILE or aws.profile, otherwise a menu
+        profile: Option<String>,
+    },
 }
 
 #[cfg(test)]

@@ -30,9 +30,10 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | --- | --- | --- |
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
+| 今の認証状態を確認する | `tora aws status` | `whoami` の内容に SSO 期限の残り時間を加えて表示 |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
 | 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
-| 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証を診断 |
+| 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証・SSO 期限を診断 |
 | AWS の実際の接続先を確認する | `tora aws whoami` | アカウント・ARN・リージョンを表示 |
 | SSO セッションを終了する | `tora aws logout` | 全プロファイルの SSO キャッシュをログアウト |
 | 既定値を保存する | `tora config set aws.profile dev` | プロファイル・リージョンを設定 |
@@ -151,6 +152,9 @@ tora config unset aws.region
 Bash/Zsh の補完設定、AWS CLI v2、STS による実際の認証状態を確認します。
 問題があっても残りの診断を続け、すべて正常なら終了コード0、要対応なら1を返します。
 自動修復・SSO ログインは行いません。AWS CLI 自身の認証情報の更新は通常どおり行われます。
+`--profile` または既定のプロファイル（環境変数・`aws.profile`）があれば、認証の結果に
+`tora aws status` と同じ SSO トークンの期限と残り時間を加えます。期限切れは認証の項目 1 件として
+要対応になり、判定できない場合は `unknown` と表示して失敗にはしません。
 補完は `tora completion install` が保存したカスタムパスにも対応します。
 親シェルが補完を読み込み済みか、手動の補完設定が有効かは判定できません。
 
@@ -221,7 +225,7 @@ Zsh では説明も表示できます。現在のシェルで有効にするコ�
 
 Zsh / Bash では、プロファイルを指定する位置で Tab を押すと
 `aws configure list-profiles` で得られるプロファイル名を補完します。対象は
-`tora aws sso` / `tora aws exec` / `tora aws whoami` のプロファイル引数、
+`tora aws sso` / `tora aws exec` / `tora aws whoami` / `tora aws status` のプロファイル引数、
 `tora doctor --profile`、`tora config set aws.profile` の値です。`tora aws exec` の
 `--` より後（実行するコマンド）では補完しません。AWS CLI が見つからない・失敗した場合は
 エラーを表示せず、プロファイル名の候補を出さないだけです。Tab のたびに AWS CLI を呼ぶため、
@@ -256,7 +260,7 @@ tora aws profiles                  # 設定済みプロファイルの一覧
 tora aws sso                       # 現在のプロファイルで認証確認 → 必要ならログイン → シェル
 tora aws sso --select              # プロファイルを選び直して認証用シェルへ
 tora aws sso dev                   # プロファイルを指定して認証用シェルへ
-aws sts get-caller-identity        # シェル内で認証先を確認
+tora aws status                    # プロファイル・認証先・SSO 期限の残り時間を確認
 exit                              # 元のシェルに戻る
 ```
 
@@ -302,7 +306,54 @@ Zsh / Bash では、プロンプトの先頭に黄色の `[aws:プロファイ�
 それ以外のシェルではプロファイル設定のみ行います。
 元のシェルの環境は変わりません。シェル設定ファイルで AWS 環境変数を再設定している場合は、
 その設定が優先されるので `aws sts get-caller-identity` で確認してください。
-認証用シェルを開くだけでは認証期限は延長されません。期限切れ時は `tora aws sso` を再実行してください。
+認証用シェルを開くだけでは認証期限は延長されません。残り時間は `tora aws status` で確認し、
+期限切れ時は `tora aws sso` を再実行してください。
+
+</details>
+
+### 認証状態を確認する
+
+```sh
+tora aws status                    # 現在のプロファイルの認証状態
+tora aws status dev                # プロファイルを指定
+```
+
+```text
+Profile: dev
+Account: 123456789012
+ARN: arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_0123456789abcdef/alice
+User ID: AROAEXAMPLE:alice
+Region: ap-northeast-1
+SSO expires: 2026-11-16T09:30:00Z (3h 12m remaining)
+```
+
+`whoami` との違い: `status` は常にプロファイルを決めて（未設定なら選択メニュー）その認証で確認し、SSO トークンの期限と残り時間を追加で表示します。
+
+プロファイルは `tora aws sso` と同じ規則（引数、空でない `AWS_PROFILE`、空でない
+`AWS_DEFAULT_PROFILE`、`aws.profile` の保存値、いずれもなければ選択メニュー）で決定します。
+未ログイン・期限切れの場合は `tora aws sso` を案内して終了コード 1 で終了します。
+自動でログインはしません。
+
+<details>
+<summary>認証状態の確認方法と SSO 期限の求め方</summary>
+
+認証先の確認と表示は `tora aws whoami <profile>` と同じ処理です。確認時は `tora aws sso` と同じく、
+競合するアクセスキー環境変数を外します。通信障害・設定不備など、
+未ログイン・期限切れ以外のエラーは表示して停止します。
+
+SSO 期限は `aws configure get` で `sso_session`（なければ `sso_start_url`）を取得し、
+`~/.aws/sso/cache/` にある対応するキャッシュファイルの `expiresAt` から求めます。
+`sso-session` を使う設定と、プロファイルに `sso_start_url` を直接書く従来の設定の
+両方に対応します。時刻はキャッシュの記録どおり（UTC）に表示します。
+SSO を使わないプロファイルやキャッシュが見つからない場合など、判定できなければ
+`unknown` と表示し、失敗にはしません。キャッシュからは期限だけを読み取り、
+トークンの値は表示・出力しません。
+
+`sso-session` を使う設定では、表示される期限は現在のアクセストークンのものです。
+SSO セッションが続く間は AWS CLI が自動更新するため、
+`refreshed automatically while the SSO session lasts` と表示します。
+SSO トークンの期限後も、取得済みのロール認証情報が有効な間は認証に成功し、
+期限は `(expired)` と表示されます。
 
 </details>
 
@@ -414,6 +465,7 @@ bash scripts/check.sh              # CI・リリースと共通の検証
 - `src/paths.rs`: 保存先とインストール済みバイナリの判定を共通化。
 - `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
 - `src/aws/settings.rs`: 1操作ごとの設定の読み込み、認証環境と export の生成。
+- `src/aws/status.rs`: `whoami` の表示に SSO 期限を加える `aws status`。
 - `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
 - `src/config.rs` / `src/doctor.rs`: 既定値の保存と環境診断。
 - `tests/helpers.rs`: 設定・接続先確認・ログアウト・診断・更新確認の結合テスト。
