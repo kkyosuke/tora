@@ -42,18 +42,19 @@ pub(super) fn run(profile: &str, settings: &Settings) -> io::Result<()> {
     )))
 }
 
-/// The SSO token expiry for doctor: Ok(None) when it cannot be determined,
+/// The `SSO expires:` text for doctor (`unknown` when it cannot be determined);
 /// an error when the token has already expired.
-pub(super) fn expiry(profile: &str, settings: &Settings) -> io::Result<Option<String>> {
-    let Some(expiry) = sso_expiry(profile, settings) else {
-        return Ok(None);
-    };
+pub(super) fn expiry(profile: &str, settings: &Settings) -> io::Result<String> {
+    let expiry = sso_expiry(profile, settings);
     let now = now();
-    let text = format!("{profile}: {}", describe_expiry(Some(&expiry), now));
-    if expiry.epoch <= now {
-        return Err(io::Error::other(format!("{text}; {}", login_hint(profile))));
+    let text = describe_expiry(expiry.as_ref(), now);
+    if expiry.is_some_and(|expiry| expiry.epoch <= now) {
+        return Err(io::Error::other(format!(
+            "SSO token for profile {profile:?} expires: {text}; {}",
+            login_hint(profile)
+        )));
     }
-    Ok(Some(text))
+    Ok(text)
 }
 
 fn login_hint(profile: &str) -> String {

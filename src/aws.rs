@@ -384,14 +384,14 @@ fn select_profile(
 }
 
 /// SSO token expiry of the explicit or default profile, for doctor.
-/// Ok(None) when no profile is selected or the expiry cannot be determined.
+/// Ok(None) when no profile is selected; an error when the token has expired.
 pub fn sso_expiry(explicit: Option<String>) -> io::Result<Option<String>> {
     let settings = Settings::load()?;
     let Some(profile) = explicit.or(settings.profile.clone()) else {
         return Ok(None);
     };
     validate_profile(&profile)?;
-    status::expiry(&profile, &settings)
+    status::expiry(&profile, &settings).map(Some)
 }
 
 // With no explicit argument, preserve ambient credentials: whoami must describe

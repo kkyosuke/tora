@@ -441,7 +441,7 @@ fn doctor_aggregates_failures_without_installing_or_logging_in() {
 }
 
 #[test]
-fn doctor_reports_sso_expiry_without_failing_when_unknown() {
+fn doctor_reports_sso_expiry_in_the_authentication_check() {
     let f = Fixture::new();
     let cache = f.path(".aws/sso/cache");
     fs::create_dir_all(&cache).unwrap();
@@ -453,7 +453,15 @@ fn doctor_reports_sso_expiry_without_failing_when_unknown() {
             .env("TEST_SSO_SESSION", "abc")
             .output()
             .unwrap();
-        String::from_utf8(out.stdout).unwrap()
+        let text = String::from_utf8(out.stdout).unwrap();
+        // Authentication and SSO expiry are one check, never two results.
+        assert_eq!(
+            text.matches("AWS authentication / SSO").count(),
+            1,
+            "{text}"
+        );
+        assert!(!text.contains("secret"));
+        text
     };
 
     fs::write(
@@ -462,13 +470,13 @@ fn doctor_reports_sso_expiry_without_failing_when_unknown() {
     )
     .unwrap();
     let text = doctor(&["doctor", "--profile", "dev"]);
+    assert!(text.contains("[OK] AWS authentication / SSO: Profile: dev\n"));
     assert!(
-        text.contains("[OK] AWS SSO expiry: dev: 2099-01-01T00:00:00Z ("),
+        text.contains("Region: ap-northeast-1\nSSO expires: 2099-01-01T00:00:00Z ("),
         "{text}"
     );
-    assert!(!text.contains("secret"));
     // Without a selected profile the expiry cannot be attributed to one.
-    assert!(doctor(&["doctor"]).contains("[SKIP] AWS SSO expiry: unknown"));
+    assert!(!doctor(&["doctor"]).contains("SSO expires"));
 
     fs::write(
         &token,
@@ -478,13 +486,16 @@ fn doctor_reports_sso_expiry_without_failing_when_unknown() {
     let text = doctor(&["doctor", "--profile", "dev"]);
     assert!(
         text.contains(
-            "[WARN] AWS SSO expiry: dev: 2000-01-01T00:00:00Z (expired); run `tora aws sso dev`"
+            "[WARN] AWS authentication / SSO: SSO token for profile \"dev\" expires: \
+             2000-01-01T00:00:00Z (expired); run `tora aws sso dev` to log in"
         ),
         "{text}"
     );
 
     fs::remove_file(&token).unwrap();
-    assert!(doctor(&["doctor", "--profile", "dev"]).contains("[SKIP] AWS SSO expiry: unknown"));
+    let text = doctor(&["doctor", "--profile", "dev"]);
+    assert!(text.contains("[OK] AWS authentication / SSO: Profile: dev\n"));
+    assert!(text.contains("SSO expires: unknown\n"), "{text}");
 }
 
 #[test]
