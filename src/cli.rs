@@ -122,7 +122,7 @@ pub enum AwsCommands {
     /// Print the current profile and SSO time left for a shell prompt (fast, never fails)
     #[command(
         long_about = "Print the current profile and SSO time left for a shell prompt.\n\n\
-            Uses AWS_PROFILE or AWS_DEFAULT_PROFILE (not the saved aws.profile) and reads \
+            Uses AWS_PROFILE, AWS_DEFAULT_PROFILE or the saved aws.profile and reads \
             the AWS config file and SSO token cache directly, without AWS CLI or the network. \
             Prints nothing when no profile is set and never writes to stderr or fails.\n\n\
             Time left is like 52m or 3h 13m, or `expired` once the SSO token has expired \

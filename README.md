@@ -375,12 +375,14 @@ tora aws prompt --format '{profile}:{remaining}' # dev:52m
 | SSO トークンが有効 | `dev (52m)` / `dev (3h 12m)` / `dev (<1m)` |
 | 期限切れ | `dev (expired)` |
 | SSO を使わない・期限を判定できない | `dev` |
-| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` が未設定（空を含む） | 何も出力しない |
+| プロファイルが未設定 | 何も出力しない |
 
 プロンプトは毎回実行されるため、AWS CLI もネットワークも使わず、AWS の設定ファイル
 （`AWS_CONFIG_FILE` または `~/.aws/config`）と SSO キャッシュを直接読みます（目安 2ms）。
 選択メニューは出さず、標準エラーにも出力せず、常に終了コード 0 で終了します。
-表示するのはシェルの `aws` コマンドが使う環境変数のプロファイルで、`aws.profile` の保存値は使いません。
+プロファイルは `tora aws status` と同じく、空でない `AWS_PROFILE`、`AWS_DEFAULT_PROFILE`、`aws.profile` の保存値の順で決めます
+（tora の設定ファイルが壊れている場合は保存値を使わず、エラーも表示しません）。
+保存値は tora のコマンドだけが使い、シェルで直接実行する `aws` には反映されない点に注意してください。
 `--format` では `{profile}` と `{remaining}`（判定できなければ空）を置き換えます。
 
 残り時間と `expired` の判定は `tora aws status` / `tora doctor` と同じく現在のアクセストークンの期限です。
@@ -398,14 +400,14 @@ starship（`~/.config/starship.toml`）: 組み込みの `[aws]` と重複する
 ```toml
 [custom.tora_aws]
 command = "tora aws prompt"
-when = 'case "${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}" in ""|*prod*) false ;; esac'
+when = 'tora aws prompt | grep -qv prod'
 shell = ["sh"]
 format = "[☁ $output]($style) "
 style = "bold yellow"
 
 [custom.tora_aws_prod]
 command = "tora aws prompt"
-when = 'case "${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}" in *prod*) true ;; *) false ;; esac'
+when = 'tora aws prompt | grep -q prod'
 shell = ["sh"]
 format = "[☁ $output]($style) "
 style = "bold red"
@@ -419,7 +421,7 @@ tora_aws_prompt() {
   local out=$(tora aws prompt)
   [[ -n $out ]] || return 0
   out=${out//\%/%%}  # プロファイル名の % をプロンプトの書式として解釈させない
-  case ${AWS_PROFILE:-$AWS_DEFAULT_PROFILE} in
+  case $out in
     *prod*) print -rn -- "%F{red}[$out]%f " ;;
     *) print -rn -- "%F{yellow}[$out]%f " ;;
   esac
@@ -434,7 +436,7 @@ tora_aws_prompt() {
   local out
   out=$(tora aws prompt)
   [ -n "$out" ] || return 0
-  case ${AWS_PROFILE:-$AWS_DEFAULT_PROFILE} in
+  case $out in
     *prod*) printf '\001\033[31m\002[%s]\001\033[0m\002 ' "$out" ;;
     *) printf '[%s] ' "$out" ;;
   esac

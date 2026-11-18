@@ -1,10 +1,11 @@
 //! `tora aws prompt`: a short profile indicator for shell prompts.
 //!
 //! It runs on every prompt, so it must stay fast and quiet: it never starts
-//! AWS CLI, uses the network, reads tora's config, asks questions or writes to
-//! stderr. Anything it cannot determine is simply left out of the output.
+//! AWS CLI, uses the network, asks questions or writes to stderr. Anything it
+//! cannot determine is simply left out of the output.
 
 use super::{settings, status};
+use crate::config;
 use std::{
     env,
     io::{self, Write},
@@ -23,8 +24,10 @@ pub(super) fn run(format: Option<&str>) {
 }
 
 fn render(format: Option<&str>) -> Option<String> {
-    // The profile the shell's own `aws` commands use, not tora's saved default.
-    let profile = settings::env_value(&["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])?;
+    // The same order as other tora commands: environment, then aws.profile.
+    // A broken tora config only hides the saved default; it never fails the prompt.
+    let profile = settings::env_value(&["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])
+        .or_else(|| config::load().ok()?.profile)?;
     if profile.chars().any(char::is_control) {
         return None;
     }
