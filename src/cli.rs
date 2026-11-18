@@ -102,6 +102,27 @@ pub enum AwsCommands {
     },
     /// Log out ALL cached AWS SSO sessions across all profiles
     Logout,
+    /// Generate ~/.aws/config profiles for every SSO account and role (shows changes first)
+    Sync {
+        /// sso-session section to use; prompts when several exist
+        #[arg(long, value_name = "NAME")]
+        sso_session: Option<String>,
+        /// Region for generated profiles (default: the session's sso_region)
+        #[arg(long)]
+        region: Option<String>,
+        /// Print the generated managed block without changing files
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+        /// Apply the displayed changes without prompting (required without a terminal)
+        #[arg(long)]
+        yes: bool,
+        /// Do not automatically open the browser when SSO login is needed
+        #[arg(long)]
+        no_browser: bool,
+        /// Use device-code authorization when SSO login is needed
+        #[arg(long)]
+        use_device_code: bool,
+    },
     /// Run a command with a profile's credentials (logs in only with --login)
     Exec {
         /// Profile name; defaults to environment/config, otherwise an interactive menu
@@ -162,6 +183,29 @@ pub enum AwsCommands {
         /// Instance or managed node ID (i-… / mi-…); omit to select from a list
         #[arg(long, short = 't', value_name = "ID")]
         target: Option<String>,
+        /// Select a profile interactively, ignoring environment and saved defaults
+        #[arg(long, conflicts_with = "profile")]
+        select: bool,
+        /// Do not automatically open the browser when SSO login is needed
+        #[arg(long)]
+        no_browser: bool,
+        /// Use device-code authorization when SSO login is needed
+        #[arg(long)]
+        use_device_code: bool,
+    },
+    /// Forward a local port to a remote host through an instance (requires session-manager-plugin)
+    Tunnel {
+        /// Profile name; defaults to environment/config, otherwise a menu
+        profile: Option<String>,
+        /// Instance to forward through (i-… / mi-…); omit to select from a list
+        #[arg(long, short = 't', value_name = "ID")]
+        target: Option<String>,
+        /// Remote host and port, e.g. mydb.example.com:5432; omit to select from history
+        #[arg(long, short = 'r', value_name = "HOST:PORT")]
+        remote: Option<String>,
+        /// Local port (default: the remote port, or a free port if it is in use)
+        #[arg(long, short = 'l', value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        local: Option<u16>,
         /// Select a profile interactively, ignoring environment and saved defaults
         #[arg(long, conflicts_with = "profile")]
         select: bool,

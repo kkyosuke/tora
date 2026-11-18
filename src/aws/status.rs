@@ -119,10 +119,7 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
 /// Reads the token cache for an sso-session name or legacy start URL.
 /// Any failure means "unknown". Never starts AWS CLI.
 pub(super) fn cached_expiry(key: &str) -> Option<Expiry> {
-    let path = home()?
-        .join(".aws/sso/cache")
-        .join(format!("{}.json", sha1_hex(key.as_bytes())));
-    let content = read_small(&path, MAX_BYTES)?;
+    let content = read_cache(key)?;
     // The file also holds the access token; extract the timestamp only and
     // never print or log anything else from it.
     let text = json_string(&content, "expiresAt")?;
@@ -131,6 +128,15 @@ pub(super) fn cached_expiry(key: &str) -> Option<Expiry> {
         text: text.to_owned(),
         refreshable: json_string(&content, "refreshToken").is_some(),
     })
+}
+
+/// The AWS CLI SSO token cache file for an sso-session name (or legacy start URL).
+/// It holds the access token: callers must never print or log it.
+pub(super) fn read_cache(key: &str) -> Option<String> {
+    let path = home()?
+        .join(".aws/sso/cache")
+        .join(format!("{}.json", sha1_hex(key.as_bytes())));
+    read_small(&path, MAX_BYTES)
 }
 
 pub(super) fn home() -> Option<PathBuf> {
@@ -171,7 +177,7 @@ fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> 
 
 /// Returns the raw value of a top-level-style `"key": "value"` string member.
 /// Values with escapes are rejected; timestamps and tokens never need them here.
-fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+pub(super) fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let mut rest = json;
     while let Some(index) = rest.find(&needle) {
@@ -186,7 +192,7 @@ fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS[.fff]` followed by `Z`, `UTC` or `±HH:MM`.
-fn parse_timestamp(text: &str) -> Option<i64> {
+pub(super) fn parse_timestamp(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 || !text.is_ascii() {
         return None;

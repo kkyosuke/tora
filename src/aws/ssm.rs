@@ -50,52 +50,75 @@ pub(super) fn run(
     if let Some(target) = &target {
         check_target(target)?;
     }
-    // Fail before any login or selection when the session could never start.
+    require_plugin()?;
+    let profile = super::resolve_profile(profile, settings)?;
+    super::ensure_login(&profile, settings, no_browser, use_device_code)?;
+    let target = match target {
+        Some(target) => target,
+        None => select_target(&profile, settings)?,
+    };
+    // Record history only once a session is actually about to start (not on cancel).
+    remember(&profile, &target);
+
+    eprintln!("Starting Session Manager session on {target} with profile {profile:?}...");
+    start_session(&profile, &target, settings, &[])
+}
+
+/// Fails before any login or selection when a session could never start.
+pub(super) fn require_plugin() -> io::Result<()> {
     if crate::doctor::on_path(PLUGIN).is_none() {
         return Err(io::Error::other(format!(
             "{PLUGIN} not found in PATH; install the Session Manager plugin for AWS CLI first \
              (https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)"
         )));
     }
-    let profile = super::resolve_profile(profile, settings)?;
-    super::ensure_login(&profile, settings, no_browser, use_device_code)?;
+    Ok(())
+}
 
-    let target = match target {
-        Some(target) => target,
-        None => {
-            let mut instances = list_instances(&profile, settings)?;
-            if instances.is_empty() {
-                return Err(io::Error::other(format!(
-                    "no Session Manager managed instances found for profile {profile:?}; \
-                     check the profile's region, or pass --target"
-                )));
-            }
-            let recent = recent_targets(&profile);
-            history::sort_by_recent(&mut instances, &recent, |i| &i.id);
-            // Recent instances lead within each group, but Online instances stay first so
-            // the default selection is never an unreachable instance when one is online.
-            instances.sort_by_key(|i| !i.online());
-            let labels = labels(&instances, &recent);
-            let index = if io::stdin().is_terminal() && io::stderr().is_terminal() {
-                select_terminal(&instances, &labels)?
-            } else {
-                select_piped(
-                    &instances,
-                    &labels,
-                    &mut io::stdin().lock(),
-                    &mut io::stderr().lock(),
-                )?
-            };
-            instances.swap_remove(index).id
-        }
+/// Lists the profile's managed instances and lets the user pick one.
+pub(super) fn select_target(profile: &str, settings: &Settings) -> io::Result<String> {
+    let mut instances = list_instances(profile, settings)?;
+    if instances.is_empty() {
+        return Err(io::Error::other(format!(
+            "no Session Manager managed instances found for profile {profile:?}; \
+             check the profile's region, or pass --target"
+        )));
+    }
+    let recent = history::INSTANCES.for_profile(profile);
+    history::sort_by_recent(&mut instances, &recent, |i| &i.id);
+    // Recent instances lead within each group, but Online instances stay first so
+    // the default selection is never an unreachable instance when one is online.
+    instances.sort_by_key(|i| !i.online());
+    let labels = labels(&instances, &recent);
+    let index = if io::stdin().is_terminal() && io::stderr().is_terminal() {
+        select_terminal(&instances, &labels)?
+    } else {
+        select_piped(
+            &instances,
+            &labels,
+            &mut io::stdin().lock(),
+            &mut io::stderr().lock(),
+        )?
     };
-    // Record history only once a session is actually about to start (not on cancel).
-    history::remember(&profile);
-    history::remember_instance(&profile, &target);
+    Ok(instances.swap_remove(index).id)
+}
 
-    eprintln!("Starting Session Manager session on {target} with profile {profile:?}...");
-    let mut command = settings.profile_command(&profile);
-    command.args(["ssm", "start-session", "--target", &target]);
+/// Saves the profile and target as recently used.
+pub(super) fn remember(profile: &str, target: &str) {
+    history::remember(profile);
+    history::INSTANCES.remember_for(profile, target);
+}
+
+/// Replaces tora with `aws ssm start-session --target <target> <extra>`.
+pub(super) fn start_session(
+    profile: &str,
+    target: &str,
+    settings: &Settings,
+    extra: &[&str],
+) -> io::Result<()> {
+    let mut command = settings.profile_command(profile);
+    command.args(["ssm", "start-session", "--target", target]);
+    command.args(extra);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -119,7 +142,7 @@ pub(super) fn valid_target(target: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
 }
 
-fn check_target(target: &str) -> io::Result<()> {
+pub(super) fn check_target(target: &str) -> io::Result<()> {
     if valid_target(target) {
         Ok(())
     } else {
@@ -146,18 +169,6 @@ fn looks_like_instance_id(value: &str) -> bool {
             matches!(hex.len(), 8 | 17) && hex.chars().all(|c| c.is_ascii_hexdigit())
         })
     })
-}
-
-/// Targets used with this profile, most recent first.
-fn recent_targets(profile: &str) -> Vec<String> {
-    history::INSTANCES
-        .recent()
-        .into_iter()
-        .filter_map(|entry| {
-            let (p, target) = history::split_instance(&entry)?;
-            (p == profile).then(|| target.to_owned())
-        })
-        .collect()
 }
 
 fn text_query(profile: &str, settings: &Settings, args: &[&str]) -> io::Result<String> {

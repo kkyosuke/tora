@@ -1,16 +1,20 @@
 use std::{
     env,
     ffi::OsString,
-    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use clap::{CommandFactory, ValueEnum};
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Input, Select};
 
 use crate::cli::{Cli, CompletionCommand, ConfigKey, InstallShell};
+use crate::managed::{Change, apply, read, replace_block};
+
+fn block_range(text: &str) -> io::Result<Option<std::ops::Range<usize>>> {
+    crate::managed::block_range(text, BEGIN, END)
+}
 
 const BEGIN: &str = "# >>> tora completion >>>";
 const END: &str = "# <<< tora completion <<<";
@@ -215,47 +219,6 @@ fn quote(path: &Path) -> String {
     crate::shell::quote(path.to_str().expect("validated path"))
 }
 
-fn read(path: &Path) -> io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // A dangling symlink is not an absent file that we may replace.
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(io::Error::other(format!(
-                    "broken symlink: {}",
-                    path.display()
-                )));
-            }
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn block_range(text: &str) -> io::Result<Option<std::ops::Range<usize>>> {
-    let starts: Vec<_> = text.match_indices(BEGIN).collect();
-    let ends: Vec<_> = text.match_indices(END).collect();
-    match (starts.as_slice(), ends.as_slice()) {
-        ([], []) => Ok(None),
-        ([(start, _)], [(end, _)]) if start < end => {
-            let finish = end + END.len();
-            if (*start != 0 && !text[..*start].ends_with('\n'))
-                || (*end != 0 && !text[..*end].ends_with('\n'))
-                || !text[*start + BEGIN.len()..].starts_with('\n')
-                || (!text[finish..].is_empty() && !text[finish..].starts_with('\n'))
-            {
-                return Err(io::Error::other(
-                    "invalid tora completion markers; repair the startup file first",
-                ));
-            }
-            Ok(Some(*start..finish))
-        }
-        _ => Err(io::Error::other(
-            "duplicate or incomplete tora completion markers; repair the startup file first",
-        )),
-    }
-}
-
 fn unmanaged(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim();
@@ -265,43 +228,110 @@ fn unmanaged(text: &str) -> bool {
     })
 }
 
+// `tora-use` switches the current shell, which a child process cannot do. It
+// evaluates only a complete export statement from a successful `--export`, so a
+// failed or cancelled login leaves the environment untouched. The body is
+// shared by Bash and Zsh and stays safe under `set -eu`.
+const USE_FUNCTION: &str = r#"function tora-use {
+    local _tora_use_arg _tora_use_end= _tora_use_select=--select _tora_use_output
+    for _tora_use_arg in ${1+"$@"}; do
+        if [[ -n $_tora_use_end ]]; then
+            _tora_use_select=
+            break
+        fi
+        case $_tora_use_arg in
+            --) _tora_use_end=1 ;;
+            -h|--help)
+                printf '%s\n' 'Usage: tora-use [--select] [--no-browser] [--use-device-code] [PROFILE]' \
+                    'Switch this shell to an AWS profile, logging in through SSO only when needed.' \
+                    'Without PROFILE, select one interactively. On failure nothing is changed.'
+                return
+                ;;
+            --select) _tora_use_select= ;;
+            -*) ;;
+            *) _tora_use_select= ;;
+        esac
+    done
+    _tora_use_output=$(command tora aws sso --export ${_tora_use_select:+"$_tora_use_select"} ${1+"$@"}) || return
+    case $_tora_use_output in
+        'unset AWS_'*) eval "$_tora_use_output" ;;
+        *)
+            printf '%s\n' 'tora-use: unexpected output from tora; environment unchanged' >&2
+            return 1
+            ;;
+    esac
+}
+"#;
+
+// Profile names are data, as in the `tora` completion wrappers. Here-strings
+// instead of process substitution keep the file parseable in POSIX mode.
+const BASH_USE_COMPLETION: &str = r#"_tora_use_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" word
+    COMPREPLY=()
+    if [[ $cur == -* ]]; then
+        while IFS= read -r word; do
+            [[ -n $word ]] && COMPREPLY+=("$word")
+        done <<< "$(compgen -W '--select --no-browser --use-device-code --help' -- "$cur")"
+        return 0
+    fi
+    for word in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
+        [[ $word == --select ]] && return 0
+    done
+    while IFS= read -r word; do
+        if [[ -n $word && $word == "$cur"* ]]; then
+            printf -v word %q "$word"
+            COMPREPLY+=("$word")
+        fi
+    done <<< "$(command tora __complete-aws-profiles -- aws sso "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)"
+    return 0
+}
+complete -F _tora_use_complete tora-use
+"#;
+
+const ZSH_USE_COMPLETION: &str = r#"_tora_use() {
+    local expl
+    if [[ ${words[CURRENT]} == -* ]]; then
+        local -a options
+        options=(--select --no-browser --use-device-code --help)
+        _wanted options expl option compadd -a options
+        return
+    fi
+    # --select replaces the profile argument.
+    (( ${${(@)words[2,CURRENT-1]}[(I)--select]} )) && return 1
+    local -a profiles
+    profiles=("${(@f)$(command tora __complete-aws-profiles -- aws sso "${(@)words[2,CURRENT-1]}" 2>/dev/null)}")
+    profiles=("${(@)profiles:#}")
+    (( $#profiles )) && _wanted profiles expl 'AWS profile' compadd -a profiles
+}
+"#;
+
 fn loader(shell: InstallShell) -> String {
     let name = shell.name();
     let init = if shell == InstallShell::Zsh {
-        "    if ! (( $+functions[compdef] )); then\n        autoload -Uz compinit\n        compinit\n    fi\n    (( $+functions[compdef] )) || return\n"
+        "    if ! (( ${+functions[compdef]} )); then\n        autoload -Uz compinit\n        compinit\n    fi\n    (( ${+functions[compdef]} )) || return\n"
+    } else {
+        ""
+    };
+    // Leave the name to an alias, builtin or command that already owns it.
+    let (owner, condition, completion, register) = match shell {
+        InstallShell::Bash => ("type -t tora-use", "''|function", BASH_USE_COMPLETION, ""),
+        InstallShell::Zsh => (
+            "whence -w tora-use",
+            "*': none'|*': function'",
+            ZSH_USE_COMPLETION,
+            "if (( ${+functions[_tora_use]} && ${+functions[compdef]} )); then\n    compdef _tora_use tora-use\nfi\n",
+        ),
+    };
+    // Bash in POSIX mode (e.g. sh reading .profile) rejects the function name,
+    // and the evaluated `tora completion bash` uses process substitution.
+    let posix = if shell == InstallShell::Bash {
+        "[[ :$SHELLOPTS: != *:posix:* ]] && "
     } else {
         ""
     };
     format!(
-        "{OWNER}# Shell: {name}\n# Generate completion from the current tora on each new shell.\nif [[ -z ${{_TORA_COMPLETION_{name}_LOADED-}} ]] && command -v tora >/dev/null 2>&1; then\n{init}    if _tora_completion_script=$(command tora completion {name}); then\n        eval \"$_tora_completion_script\"\n        _TORA_COMPLETION_{name}_LOADED=1\n    fi\n    unset _tora_completion_script\nfi\n"
+        "{OWNER}# Shell: {name}\n# Define tora-use, which switches this shell to an AWS profile.\nif {posix}case $({owner} 2>/dev/null) in {condition}) true ;; *) false ;; esac; then\n{USE_FUNCTION}{completion}fi\n# Generate completion from the current tora on each new shell.\nif {posix}[[ -z ${{_TORA_COMPLETION_{name}_LOADED-}} ]] && command -v tora >/dev/null 2>&1; then\n{init}    if _tora_completion_script=$(command tora completion {name}); then\n        eval \"$_tora_completion_script\"\n        _TORA_COMPLETION_{name}_LOADED=1\n    fi\n    unset _tora_completion_script\nfi\n{register}"
     )
-}
-
-struct Change {
-    path: PathBuf,
-    before: Option<String>,
-    after: String,
-}
-
-impl Change {
-    fn new(path: PathBuf, after: String) -> io::Result<Self> {
-        let before = read(&path)?;
-        // Follow dotfile symlinks without replacing the link itself.
-        let path = if before.is_some() {
-            fs::canonicalize(path)?
-        } else {
-            path
-        };
-        Ok(Self {
-            path,
-            before,
-            after,
-        })
-    }
-
-    fn changed(&self) -> bool {
-        self.before.as_deref() != Some(&self.after)
-    }
 }
 
 fn startup_files(shell: InstallShell, home: &Path) -> io::Result<Vec<PathBuf>> {
@@ -438,24 +468,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
     let block = startup_block(shell, &destination);
     for file in files {
         let before = read(&file)?.unwrap_or_default();
-        let after = match block_range(&before)? {
-            Some(range) => format!(
-                "{}{}{}",
-                &before[..range.start],
-                block,
-                &before[range.end..]
-            ),
-            None => format!(
-                "{}{}{}\n",
-                before,
-                if before.is_empty() || before.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                },
-                block
-            ),
-        };
+        let after = replace_block(&before, block_range(&before)?, &block, "\n");
         changes.push(Change::new(file, after)?);
     }
     // Two startup paths may point to the same dotfile. Identical changes are
@@ -484,13 +497,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
     for change in &changes {
         eprintln!("  {}", change.path.display());
     }
-    if !yes
-        && !Confirm::new()
-            .with_prompt("Install completion?")
-            .default(false)
-            .interact()
-            .map_err(io::Error::other)?
-    {
+    if !crate::managed::confirm("Install completion?", yes)? {
         eprintln!("Cancelled; no files changed.");
         return Ok(());
     }
@@ -507,67 +514,6 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
         eprintln!(
             "The previous loader was retained; it is no longer referenced by the managed configuration."
         );
-    }
-    Ok(())
-}
-
-fn stage(change: &Change) -> io::Result<tempfile::NamedTempFile> {
-    let parent = change
-        .path
-        .parent()
-        .ok_or_else(|| io::Error::other("file has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    if change.before.is_some() {
-        temporary
-            .as_file()
-            .set_permissions(fs::metadata(&change.path)?.permissions())?;
-    }
-    temporary.write_all(change.after.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    Ok(temporary)
-}
-
-fn apply(changes: &[Change]) -> io::Result<()> {
-    // Prepare all writes first, so an unwritable destination does not leave a
-    // startup file pointing at a loader that could not be written.
-    let staged = changes.iter().map(stage).collect::<io::Result<Vec<_>>>()?;
-    for change in changes {
-        if read(&change.path)? != change.before {
-            return Err(io::Error::other(format!(
-                "{} changed during installation; retry",
-                change.path.display()
-            )));
-        }
-    }
-    for (index, (change, temporary)) in changes.iter().zip(staged).enumerate() {
-        if let Err(error) = temporary.persist(&change.path) {
-            let mut failures = Vec::new();
-            for previous in changes[..index].iter().rev() {
-                let restored = match &previous.before {
-                    Some(before) => stage(&Change {
-                        path: previous.path.clone(),
-                        before: Some(previous.after.clone()),
-                        after: before.clone(),
-                    })
-                    .and_then(|file| {
-                        file.persist(&previous.path)
-                            .map(|_| ())
-                            .map_err(|e| e.error)
-                    }),
-                    None => fs::remove_file(&previous.path),
-                };
-                if let Err(error) = restored {
-                    failures.push(format!("{}: {error}", previous.path.display()));
-                }
-            }
-            return Err(io::Error::other(format!(
-                "could not update {}: {}; rollback errors: {:?}",
-                change.path.display(),
-                error.error,
-                failures
-            )));
-        }
     }
     Ok(())
 }
@@ -641,6 +587,8 @@ mod tests {
             &["aws", "sso", "--no-shell", "--use-device-code"],
             &["aws", "whoami"],
             &["aws", "status"],
+            &["aws", "tunnel"],
+            &["aws", "tunnel", "-t", "i-0aaa", "--remote", "db:5432"],
             &["aws", "exec", "--login"],
             &["aws", "exec", "--login", "--no-browser"],
             &["doctor", "--profile"],
@@ -663,6 +611,9 @@ mod tests {
             &["completion", "install", "--path"],
             &["aws", "whoami", "dev"],
             &["aws", "status", "dev"],
+            &["aws", "tunnel", "dev"],
+            &["aws", "tunnel", "--remote"],
+            &["aws", "tunnel", "-l"],
             &["aws", "logout"],
             &["doctor"],
             &["doctor", "--profile", "dev"],
@@ -675,19 +626,6 @@ mod tests {
             &["aws", "exec", "--login", "dev", "--"],
         ] {
             assert!(!at(words), "{words:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_damaged_or_duplicate_managed_blocks() {
-        for text in [
-            BEGIN.to_owned(),
-            END.to_owned(),
-            format!("{END}\n{BEGIN}"),
-            format!("{BEGIN}\n{END}\n{BEGIN}\n{END}"),
-            format!("echo '{BEGIN}\n{END}'"),
-        ] {
-            assert!(block_range(&text).is_err(), "{text}");
         }
     }
 }
