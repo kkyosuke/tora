@@ -1592,3 +1592,51 @@ fn sync_refuses_damaged_markers() {
     assert_eq!(config(&f), damaged);
     assert_eq!(f.calls(), "");
 }
+
+#[test]
+fn sync_skips_names_defined_anywhere_outside_its_block() {
+    let f = sync_fixture();
+    let other_block =
+        "# >>> tora aws sync other >>>\n[profile Prod-ReadOnly]\n# <<< tora aws sync other <<<\n";
+    let text = SYNC_CONFIG.replace("[profile Prod-Admin]", "[profile Prod-Admin] # mine")
+        + "[profile \"Dev-Team-222222222222-Admin\"]\n"
+        + other_block;
+    fs::write(f.0.join("config"), &text).unwrap();
+    fs::write(f.0.join("credentials"), "[Dev-Team-333333333333-Admin]\n").unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(
+        "Skipped (already defined outside tora's managed block): Dev-Team-222222222222-Admin, Dev-Team-333333333333-Admin, Prod-Admin, Prod-ReadOnly"
+    ), "{stderr}");
+    let written = config(&f);
+    // Nothing to generate: the block holds only its header, and the other block is untouched.
+    assert!(written.starts_with(&text));
+    assert!(!written[text.len()..].contains("[profile"));
+}
+
+#[test]
+fn sync_failures_leave_the_config_unchanged_and_log_in_at_most_once() {
+    let f = sync_fixture();
+    let output = f
+        .command(&["sync", "--yes"])
+        .env("SSO_TOKEN", "never-valid")
+        .env("SSO_ACCOUNTS", "111111111111\tProd\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("aws sso list-accounts failed"), "{stderr}");
+    assert_eq!(f.calls().matches("login").count(), 1);
+    assert_eq!(config(&f), SYNC_CONFIG);
+    // The private request directory keeps no token files.
+    assert_eq!(fs::read_dir(f.0.join("tora/tmp")).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(f.0.join("tora/tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}

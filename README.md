@@ -424,12 +424,14 @@ region = ap-northeast-1
 - `region` は `--region`、未指定なら sso-session の `sso_region` です。
 - sso-session が 1 つならそれを使い、複数ある場合は選択メニュー（非対話では `--sso-session` が必要）を表示します。
 - アカウント一覧は `aws sso list-accounts` / `aws sso list-account-roles` で取得します。
-  SSO キャッシュのアクセストークンは非公開の一時ファイル経由で AWS CLI に渡し、
-  コマンドライン引数や出力には含めません。トークンがない・期限切れ・拒否された場合だけ
-  `aws sso login --sso-session 名前` を実行します（`--no-browser` / `--use-device-code` も使えます）。
+  SSO キャッシュのアクセストークンは `$TORA_HOME/tmp`（権限 700）の一時ファイル経由で AWS CLI に渡し、
+  コマンドライン引数や出力には含めません。中断で残った一時ファイルは次回の実行時に削除します。
+  トークンがない・残り10分未満・拒否された場合だけ `aws sso login --sso-session 名前` を
+  1 回実行します（`--no-browser` / `--use-device-code` も使えます）。
 - 書き換えるのは `# >>> tora aws sync 名前 >>>` から `# <<< tora aws sync 名前 <<<` までの
   管理ブロックだけで、sso-session ごとに別のブロックです。ブロック外（`~/.aws/credentials` を含む）に
-  同名のプロファイルがあれば生成せず、スキップした名前を表示します。
+  同名のプロファイル（`[profile "名前"]` のような引用符付きも含む）があれば生成せず、
+  スキップした名前を表示します。
   SSO で見えなくなったアカウント・ロールのプロファイルはブロックから削除されます。
 - 書き込み前に管理ブロックの差分を表示し、確認します（既定は「いいえ」）。`--yes` で確認を省略し、
   ターミナルでない場合は `--yes` がなければ AWS に問い合わせる前に終了します。

@@ -6,8 +6,9 @@ use super::{Settings, status};
 use crate::managed::{self, Change};
 use dialoguer::{Select, theme::ColorfulTheme};
 use std::{
+    cell::Cell,
     collections::{BTreeSet, HashMap},
-    env,
+    env, fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -81,8 +82,12 @@ pub(super) fn run(options: Options, settings: &Settings) -> io::Result<()> {
         settings,
         session: &session.name,
         region: &sso_region,
+        no_browser: options.no_browser,
+        use_device_code: options.use_device_code,
+        logged_in: Cell::new(false),
+        input_dir: input_dir()?,
     };
-    let accounts = sso.accounts(options.no_browser, options.use_device_code)?;
+    let accounts = sso.accounts()?;
     let mut roles = Vec::new();
     for account in &accounts {
         for role in sso.roles(&account.id)? {
@@ -181,15 +186,37 @@ fn sections(text: &str) -> Vec<(String, HashMap<String, String>)> {
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
-        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            sections.push((header.trim().to_owned(), HashMap::new()));
-        } else if let (Some((key, value)), Some((_, values))) =
-            (line.split_once('='), sections.last_mut())
+        // Like Python's configparser (used by AWS CLI), a header runs to the
+        // last `]`, so `[profile x] # note` is the section `profile x`.
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|l| Some(&l[..l.rfind(']')?]))
         {
-            values.insert(key.trim().to_owned(), value.trim().to_owned());
+            sections.push((header.trim().to_owned(), HashMap::new()));
+        } else if let (Some(index), Some((_, values))) =
+            (line.find(['=', ':']), sections.last_mut())
+        {
+            values.insert(
+                line[..index].trim().to_ascii_lowercase(),
+                line[index + 1..].trim().to_owned(),
+            );
         }
     }
     sections
+}
+
+/// The name in a `<kind> NAME` header. AWS CLI splits these like a shell
+/// (`[profile "dev"]` is `dev`), so surrounding quotes are removed.
+fn named(header: &str, kind: &str) -> Option<String> {
+    let name = header
+        .strip_prefix(kind)
+        .filter(|rest| rest.starts_with([' ', '\t']))?
+        .trim();
+    let unquoted = ['"', '\'']
+        .iter()
+        .find_map(|q| name.strip_prefix(*q).and_then(|n| n.strip_suffix(*q)))
+        .unwrap_or(name);
+    Some(unquoted.to_owned())
 }
 
 fn config_profiles(text: &str) -> BTreeSet<String> {
@@ -199,10 +226,7 @@ fn config_profiles(text: &str) -> BTreeSet<String> {
             if header == "default" {
                 Some(header)
             } else {
-                header
-                    .strip_prefix("profile")
-                    .filter(|rest| rest.starts_with([' ', '\t']))
-                    .map(|name| name.trim().to_owned())
+                named(&header, "profile")
             }
         })
         .collect()
@@ -212,11 +236,7 @@ fn sessions(text: &str) -> Vec<Session> {
     sections(text)
         .into_iter()
         .filter_map(|(header, values)| {
-            let name = header
-                .strip_prefix("sso-session")
-                .filter(|rest| rest.starts_with([' ', '\t']))?
-                .trim()
-                .to_owned();
+            let name = named(&header, "sso-session")?;
             Some(Session {
                 name,
                 region: values.get("sso_region").filter(|v| !v.is_empty()).cloned(),
@@ -407,6 +427,12 @@ struct Sso<'a> {
     settings: &'a Settings,
     session: &'a str,
     region: &'a str,
+    no_browser: bool,
+    use_device_code: bool,
+    /// Log in at most once per run.
+    logged_in: Cell<bool>,
+    /// Private directory for the request files that carry the token.
+    input_dir: PathBuf,
 }
 
 impl Sso<'_> {
@@ -420,36 +446,23 @@ impl Sso<'_> {
         command
     }
 
-    fn login(&self, no_browser: bool, use_device_code: bool) -> io::Result<()> {
+    fn login(&self) -> io::Result<()> {
+        self.logged_in.set(true);
         super::sso_login(
             self.command(),
             &["--sso-session", self.session],
             &format!("sso-session {:?}", self.session),
-            no_browser,
-            use_device_code,
+            self.no_browser,
+            self.use_device_code,
         )
     }
 
-    /// Lists accounts, logging in first when the cached token is missing or
-    /// expired, or once when AWS rejects it.
-    fn accounts(&self, no_browser: bool, use_device_code: bool) -> io::Result<Vec<Account>> {
-        if access_token(self.session).is_none() {
-            self.login(no_browser, use_device_code)?;
-        }
-        let query = "accountList[].[accountId,accountName]";
-        let output = match self.call("list-accounts", None, query)? {
-            Ok(output) => output,
-            Err(error)
-                if error
-                    .to_ascii_lowercase()
-                    .contains("(unauthorizedexception)") =>
-            {
-                self.login(no_browser, use_device_code)?;
-                self.call("list-accounts", None, query)?
-                    .map_err(|error| self.failure("list-accounts", &error))?
-            }
-            Err(error) => return Err(self.failure("list-accounts", &error)),
-        };
+    fn accounts(&self) -> io::Result<Vec<Account>> {
+        let output = self.query(
+            "list-accounts",
+            None,
+            "accountList[].[accountId,accountName]",
+        )?;
         let mut accounts = Vec::new();
         for line in output.lines().filter(|line| !line.is_empty()) {
             let (id, name) = line.split_once('\t').unwrap_or((line, ""));
@@ -468,13 +481,11 @@ impl Sso<'_> {
     }
 
     fn roles(&self, account_id: &str) -> io::Result<Vec<String>> {
-        let output = self
-            .call(
-                "list-account-roles",
-                Some(account_id),
-                "roleList[].[roleName]",
-            )?
-            .map_err(|error| self.failure("list-account-roles", &error))?;
+        let output = self.query(
+            "list-account-roles",
+            Some(account_id),
+            "roleList[].[roleName]",
+        )?;
         Ok(output
             .lines()
             .filter(|line| !line.is_empty())
@@ -482,12 +493,36 @@ impl Sso<'_> {
             .collect())
     }
 
-    fn failure(&self, operation: &str, error: &str) -> io::Error {
-        io::Error::other(format!(
-            "aws sso {operation} failed for sso-session {:?}: {}",
-            self.session,
-            error.trim()
-        ))
+    /// Runs an `aws sso` query, logging in (once per run) when the cached token
+    /// is missing, about to expire, or rejected by AWS.
+    fn query(&self, operation: &str, account_id: Option<&str>, query: &str) -> io::Result<String> {
+        loop {
+            let Some(token) = access_token(self.session) else {
+                if self.logged_in.get() {
+                    return Err(io::Error::other(format!(
+                        "no valid SSO token cached for sso-session {:?} after login",
+                        self.session
+                    )));
+                }
+                self.login()?;
+                continue;
+            };
+            let error = match self.call(operation, account_id, query, &token)? {
+                Ok(output) => return Ok(output),
+                Err(error) => error,
+            };
+            let rejected = error
+                .to_ascii_lowercase()
+                .contains("(unauthorizedexception)");
+            if !rejected || self.logged_in.get() {
+                return Err(io::Error::other(format!(
+                    "aws sso {operation} failed for sso-session {:?}: {}",
+                    self.session,
+                    error.trim()
+                )));
+            }
+            self.login()?;
+        }
     }
 
     /// Ok(Err(stderr)) when AWS CLI reports a failure.
@@ -496,16 +531,14 @@ impl Sso<'_> {
         operation: &str,
         account_id: Option<&str>,
         query: &str,
+        token: &str,
     ) -> io::Result<Result<String, String>> {
-        let token = access_token(self.session).ok_or_else(|| {
-            io::Error::other(format!(
-                "no valid SSO token cached for sso-session {:?} after login",
-                self.session
-            ))
-        })?;
-        // Pass the token in a private temporary file, never on the command
-        // line where other local users could read it from the process list.
-        let mut input = tempfile::NamedTempFile::new()?;
+        // Pass the token in a private file, never on the command line where
+        // other local users could read it from the process list. AWS CLI
+        // cannot read --cli-input-json from a pipe.
+        let mut input = tempfile::Builder::new()
+            .prefix(INPUT_PREFIX)
+            .tempfile_in(&self.input_dir)?;
         let account = account_id
             .map(|id| format!(", \"accountId\": \"{id}\""))
             .unwrap_or_default();
@@ -533,12 +566,43 @@ impl Sso<'_> {
     }
 }
 
-/// The cached access token for an sso-session while it stays valid for at
-/// least another minute. The token is a secret: never print or log it.
+const INPUT_PREFIX: &str = "sso-request-";
+
+/// `$TORA_HOME/tmp`, private to the user. Request files left behind by an
+/// interrupted run (Ctrl-C while AWS CLI runs) are removed here; recent ones
+/// may belong to a concurrent run and are kept.
+fn input_dir() -> io::Result<PathBuf> {
+    let dir = crate::paths::home()?.join("tmp");
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    for entry in fs::read_dir(&dir)?.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|time| time.elapsed().is_ok_and(|age| age.as_secs() > 600));
+        if stale
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(INPUT_PREFIX)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(dir)
+}
+
+/// The cached access token for an sso-session while it stays valid for ten
+/// more minutes, enough to list many accounts one by one. The token is a
+/// secret: never print or log it.
 fn access_token(session: &str) -> Option<String> {
     let content = status::read_cache(session)?;
     let expires = status::parse_timestamp(status::json_string(&content, "expiresAt")?)?;
-    if expires <= status::now() + 60 {
+    if expires <= status::now() + 600 {
         return None;
     }
     let token = status::json_string(&content, "accessToken")?;
@@ -611,6 +675,22 @@ mod tests {
                     region: None
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_headers_and_keys_like_aws_cli() {
+        let text = "[profile a] # note\n[profile \"b\"]\n[profile 'c']\n[sso-session \"corp\"]\nSSO_Region: us-west-2\n";
+        assert_eq!(
+            config_profiles(text),
+            BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()])
+        );
+        assert_eq!(
+            sessions(text),
+            [Session {
+                name: "corp".into(),
+                region: Some("us-west-2".into())
+            }]
         );
     }
 
