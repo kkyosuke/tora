@@ -291,6 +291,7 @@ dependencies = [
  "clap_complete",
  "dialoguer",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]

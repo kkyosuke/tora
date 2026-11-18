@@ -1,5 +1,6 @@
 mod history;
 mod settings;
+mod ssm;
 mod status;
 
 use settings::Settings;
@@ -95,6 +96,23 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
                 return open_shell(&profile, &settings);
             }
             Ok(())
+        }
+        AwsCommands::Ssm {
+            profile,
+            target,
+            select,
+            no_browser,
+            use_device_code,
+        } => {
+            // Only the positional argument can be a mistyped instance ID; environment and
+            // saved defaults are real profile names.
+            ssm::check_profile_argument(profile.as_deref())?;
+            let profile = if select {
+                None
+            } else {
+                profile.or(settings.profile.clone())
+            };
+            ssm::run(profile, target, &settings, no_browser, use_device_code)
         }
         AwsCommands::Status { profile } => {
             let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;
@@ -207,11 +225,17 @@ fn resolve_profile(profile: Option<String>, settings: &Settings) -> io::Result<S
         Some(profile) => profile,
         None => {
             let mut profiles = profiles(settings)?;
-            history::sort(&mut profiles);
+            let recent = history::recent_profiles();
+            history::sort_by_recent(&mut profiles, &recent, |p| p);
             if io::stdin().is_terminal() && io::stderr().is_terminal() {
-                select_terminal_profile(&profiles)?
+                select_terminal_profile(&profiles, &recent)?
             } else {
-                select_profile(&profiles, &mut io::stdin().lock(), &mut io::stderr().lock())?
+                select_profile(
+                    &profiles,
+                    &recent,
+                    &mut io::stdin().lock(),
+                    &mut io::stderr().lock(),
+                )?
             }
         }
     };
@@ -228,11 +252,11 @@ fn filtered_profiles(profiles: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
-fn select_terminal_profile(profiles: &[String]) -> io::Result<String> {
+fn select_terminal_profile(profiles: &[String], recent: &[String]) -> io::Result<String> {
     let theme = ColorfulTheme::default();
     let mut visible = profiles.to_vec();
     while !profiles.is_empty() {
-        let mut items = visible.clone();
+        let mut items: Vec<String> = visible.iter().map(|p| profile_label(p, recent)).collect();
         items.push("Type a custom profile".into());
         items.push("Search profiles".into());
         let selection = Select::with_theme(&theme)
@@ -328,8 +352,13 @@ fn read_line(input: &mut impl BufRead) -> io::Result<String> {
     Ok(line.trim().to_owned())
 }
 
+fn profile_label(profile: &str, recent: &[String]) -> String {
+    format!("{profile}{}", history::marker(profile, recent))
+}
+
 fn select_profile(
     profiles: &[String],
+    recent: &[String],
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> io::Result<String> {
@@ -343,7 +372,12 @@ fn select_profile(
         } else {
             writeln!(output, "Select AWS profile:")?;
             for (index, profile) in visible.iter().enumerate() {
-                writeln!(output, "  {}. {profile}", index + 1)?;
+                writeln!(
+                    output,
+                    "  {}. {}",
+                    index + 1,
+                    profile_label(profile, recent)
+                )?;
             }
             writeln!(output, "  0. Type a custom profile")?;
         }
@@ -505,7 +539,7 @@ mod tests {
         let mut output = Vec::new();
         let profiles = vec!["default".into(), "dev".into()];
         assert_eq!(
-            select_profile(&profiles, &mut input, &mut output).unwrap(),
+            select_profile(&profiles, &[], &mut input, &mut output).unwrap(),
             "dev"
         );
     }
@@ -514,7 +548,7 @@ mod tests {
     fn zero_selects_custom_and_empty_names_retry() {
         let mut input = &b"0\n\n0\ncustom\n"[..];
         assert_eq!(
-            select_profile(&["dev".into()], &mut input, &mut Vec::new()).unwrap(),
+            select_profile(&["dev".into()], &[], &mut input, &mut Vec::new()).unwrap(),
             "custom"
         );
     }
@@ -522,7 +556,7 @@ mod tests {
     #[test]
     fn empty_list_allows_manual_input() {
         assert_eq!(
-            select_profile(&[], &mut &b"manual\n"[..], &mut Vec::new()).unwrap(),
+            select_profile(&[], &[], &mut &b"manual\n"[..], &mut Vec::new()).unwrap(),
             "manual"
         );
     }
@@ -530,7 +564,9 @@ mod tests {
     #[test]
     fn eof_and_cancel_abort() {
         for input in [&b""[..], &b"q\n"[..]] {
-            assert!(select_profile(&["dev".into()], &mut &input[..], &mut Vec::new()).is_err());
+            assert!(
+                select_profile(&["dev".into()], &[], &mut &input[..], &mut Vec::new()).is_err()
+            );
         }
     }
 }

@@ -141,6 +141,23 @@ pub enum AwsCommands {
         #[arg(long)]
         use_device_code: bool,
     },
+    /// Start a Session Manager session on an instance (requires session-manager-plugin)
+    Ssm {
+        /// Profile name; defaults to environment/config, otherwise a menu
+        profile: Option<String>,
+        /// Instance or managed node ID (i-… / mi-…); omit to select from a list
+        #[arg(long, short = 't', value_name = "ID")]
+        target: Option<String>,
+        /// Select a profile interactively, ignoring environment and saved defaults
+        #[arg(long, conflicts_with = "profile")]
+        select: bool,
+        /// Do not automatically open the browser when SSO login is needed
+        #[arg(long)]
+        no_browser: bool,
+        /// Use device-code authorization when SSO login is needed
+        #[arg(long)]
+        use_device_code: bool,
+    },
     /// Show whoami for a profile plus its SSO token expiry (does not log in)
     Status {
         /// Profile name; defaults to AWS_PROFILE, AWS_DEFAULT_PROFILE or aws.profile, otherwise a menu
