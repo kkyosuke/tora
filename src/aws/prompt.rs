@@ -38,10 +38,8 @@ fn render(format: Option<&str>) -> Option<String> {
     })
 }
 
-/// The access token's time left (`52m`, `3h 13m`, `<1m`), `expired`, or
-/// `refresh` when it has expired but has a refresh token: AWS CLI renews it on
-/// the next call if the SSO session (whose end is not cached) still lasts.
-/// None when unknown.
+/// The access token's time left (`52m`, `3h 13m`, `<1m`) or `expired`, like
+/// `tora aws status` and doctor. None when unknown.
 fn remaining(profile: &str, now: i64) -> Option<String> {
     let config = status::read_small(&config_path()?, MAX_CONFIG_BYTES)?;
     // The same cache keys as `tora aws status`, read without AWS CLI.
@@ -49,12 +47,11 @@ fn remaining(profile: &str, now: i64) -> Option<String> {
         .or_else(|| profile_value(&config, profile, "sso_start_url"))?;
     let expiry = status::cached_expiry(key)?;
     let seconds = expiry.epoch - now;
-    Some(match (seconds > 0, expiry.refreshable) {
+    Some(match seconds {
+        ..=0 => "expired".into(),
         // `less than 1m` is too long for a prompt.
-        (true, _) if seconds < 60 => "<1m".into(),
-        (true, _) => status::duration(seconds),
-        (false, true) => "refresh".into(),
-        (false, false) => "expired".into(),
+        1..60 => "<1m".into(),
+        _ => status::duration(seconds),
     })
 }
 

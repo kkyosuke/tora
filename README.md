@@ -374,7 +374,6 @@ tora aws prompt --format '{profile}:{remaining}' # dev:52m
 | --- | --- |
 | SSO トークンが有効 | `dev (52m)` / `dev (3h 12m)` / `dev (<1m)` |
 | 期限切れ | `dev (expired)` |
-| アクセストークンは期限切れだが更新用トークンがある（SSO セッション中なら次の `aws` 実行で自動更新） | `dev (refresh)` |
 | SSO を使わない・期限を判定できない | `dev` |
 | `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` が未設定（空を含む） | 何も出力しない |
 
@@ -384,9 +383,9 @@ tora aws prompt --format '{profile}:{remaining}' # dev:52m
 表示するのはシェルの `aws` コマンドが使う環境変数のプロファイルで、`aws.profile` の保存値は使いません。
 `--format` では `{profile}` と `{remaining}`（判定できなければ空）を置き換えます。
 
-残り時間は `tora aws status` と同じく現在のアクセストークンの期限です。`sso-session` を使う設定では
-約 1 時間ごとに `refresh` になりますが、SSO セッションが続く間は AWS CLI が自動更新します。
-SSO セッション自体の終了時刻はキャッシュに残らないため、`refresh` のままコマンドが失敗する場合は
+残り時間と `expired` の判定は `tora aws status` / `tora doctor` と同じく現在のアクセストークンの期限です。
+`sso-session` を使う設定では約 1 時間ごとに `expired` になりますが、SSO セッションが続く間は
+次の `aws` 実行時に AWS CLI が自動更新します。`expired` のままコマンドが失敗する場合は
 `tora aws sso` でログインしてください。設定ファイルのパスは `~` だけを展開します（`$HOME` などは展開しません）。
 
 <details>

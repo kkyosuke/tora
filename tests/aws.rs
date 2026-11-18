@@ -1070,8 +1070,9 @@ fn prompt_shows_profile_and_sso_time_left_without_aws_cli() {
             "dev (expired)\n",
         ),
         (
+            // Like status and doctor, even when AWS CLI could still refresh it.
             r#"{"expiresAt": "2000-01-01T00:00:00Z", "refreshToken": "secret"}"#,
-            "dev (refresh)\n",
+            "dev (expired)\n",
         ),
         // Unknown expiry: the profile alone.
         ("not json", "dev\n"),

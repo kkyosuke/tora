@@ -78,8 +78,7 @@ pub(super) struct Expiry {
     /// Validated timestamp text from the cache file (digits and separators only).
     text: String,
     pub(super) epoch: i64,
-    /// AWS CLI renews the access token with this while the SSO session lasts.
-    pub(super) refreshable: bool,
+    refreshable: bool,
 }
 
 fn describe_expiry(expiry: Option<&Expiry>, now: i64) -> String {

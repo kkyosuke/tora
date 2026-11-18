@@ -125,8 +125,8 @@ pub enum AwsCommands {
             Uses AWS_PROFILE or AWS_DEFAULT_PROFILE (not the saved aws.profile) and reads \
             the AWS config file and SSO token cache directly, without AWS CLI or the network. \
             Prints nothing when no profile is set and never writes to stderr or fails.\n\n\
-            Time left is like 52m or 3h 13m; `expired` once the token has expired, or \
-            `refresh` when AWS CLI can still renew it with the SSO session."
+            Time left is like 52m or 3h 13m, or `expired` once the SSO token has expired \
+            (as in `tora aws status`)."
     )]
     Prompt {
         /// Output template with {profile} and {remaining} (empty when unknown)
