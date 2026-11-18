@@ -1031,6 +1031,159 @@ fn status_resolves_profile_like_sso() {
     assert_eq!(f.calls(), "configure\nlist-profiles\n");
 }
 
+/// Runs `tora aws prompt`, asserting it succeeds silently and never calls AWS CLI.
+fn prompt(f: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let mut command = f.command(&["prompt"]);
+    command.args(args).env_remove("AWS_CONFIG_FILE");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(f.calls(), "", "the prompt must not start AWS CLI");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn write_aws_config(f: &Fixture, path: &str, content: &str) {
+    let path = f.0.join(path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+#[test]
+fn prompt_shows_profile_and_sso_time_left_without_aws_cli() {
+    let f = Fixture::new();
+    write_aws_config(
+        &f,
+        ".aws/config",
+        "[profile dev]\nsso_session = abc\n\n[sso-session abc]\nsso_start_url = https://example.awsapps.com/start\n",
+    );
+    write_sso_cache(
+        &f,
+        SESSION_CACHE,
+        r#"{"accessToken": "secret-token", "expiresAt": "2099-01-01T00:00:00Z"}"#,
+    );
+    let stdout = prompt(&f, &[], &[("AWS_PROFILE", "dev")]);
+    assert!(
+        stdout.starts_with("dev (") && stdout.ends_with("m)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains('h') && !stdout.contains("secret"),
+        "{stdout}"
+    );
+
+    let stdout = prompt(
+        &f,
+        &["--format", "aws:{profile}/{remaining}"],
+        &[("AWS_PROFILE", "dev")],
+    );
+    assert!(
+        stdout.starts_with("aws:dev/") && stdout.ends_with("m\n"),
+        "{stdout}"
+    );
+
+    for (cache, expected) in [
+        (
+            r#"{"expiresAt": "2000-01-01T00:00:00Z"}"#,
+            "dev (expired)\n",
+        ),
+        (
+            // Like status and doctor, even when AWS CLI could still refresh it.
+            r#"{"expiresAt": "2000-01-01T00:00:00Z", "refreshToken": "secret"}"#,
+            "dev (expired)\n",
+        ),
+        // Unknown expiry: the profile alone.
+        ("not json", "dev\n"),
+    ] {
+        write_sso_cache(&f, SESSION_CACHE, cache);
+        assert_eq!(prompt(&f, &[], &[("AWS_PROFILE", "dev")]), expected);
+    }
+    assert_eq!(
+        prompt(
+            &f,
+            &["--format", "[{profile}{remaining}]"],
+            &[("AWS_PROFILE", "dev")]
+        ),
+        "[dev]\n"
+    );
+}
+
+#[test]
+fn prompt_reads_legacy_profiles_from_aws_config_file() {
+    let f = Fixture::new();
+    write_aws_config(
+        &f,
+        "custom/aws-config",
+        &format!("[default]\nsso_start_url = {START_URL}\n"),
+    );
+    write_sso_cache(
+        &f,
+        START_URL_CACHE,
+        r#"{"expiresAt": "2000-01-01T00:00:00UTC"}"#,
+    );
+    for config in [
+        "~/custom/aws-config",
+        f.0.join("custom/aws-config").to_str().unwrap(),
+    ] {
+        assert_eq!(
+            prompt(
+                &f,
+                &[],
+                &[
+                    ("AWS_DEFAULT_PROFILE", "default"),
+                    ("AWS_CONFIG_FILE", config)
+                ]
+            ),
+            "default (expired)\n"
+        );
+    }
+    // ~/.aws/config is not consulted when AWS_CONFIG_FILE points elsewhere.
+    assert_eq!(
+        prompt(
+            &f,
+            &[],
+            &[("AWS_PROFILE", "default"), ("AWS_CONFIG_FILE", "missing")]
+        ),
+        "default\n"
+    );
+}
+
+#[test]
+fn prompt_resolves_profile_like_status_but_is_silent_without_one() {
+    let f = Fixture::new();
+    assert_eq!(prompt(&f, &[], &[]), "");
+    assert_eq!(prompt(&f, &[], &[("AWS_PROFILE", "")]), "");
+    fs::create_dir_all(f.0.join("tora")).unwrap();
+    fs::write(f.0.join("tora/config"), "aws.profile=saved\n").unwrap();
+    assert_eq!(prompt(&f, &[], &[]), "saved\n");
+    assert_eq!(
+        prompt(&f, &[], &[("AWS_DEFAULT_PROFILE", "fallback")]),
+        "fallback\n"
+    );
+    // A broken tora config neither fails nor prints anything.
+    fs::write(f.0.join("tora/config"), "aws.profile=saved\nbroken\n").unwrap();
+    assert_eq!(prompt(&f, &[], &[]), "");
+    assert_eq!(prompt(&f, &[], &[("AWS_PROFILE", "bad\u{1b}[31m")]), "");
+    assert_eq!(
+        prompt(
+            &f,
+            &[],
+            &[
+                ("AWS_PROFILE", "current"),
+                ("AWS_DEFAULT_PROFILE", "fallback")
+            ]
+        ),
+        "current\n"
+    );
+    assert!(!f.0.join("tora/aws-profile-history").exists());
+}
+
 /// A port free on all loopback and wildcard addresses, as `tora aws tunnel` requires.
 fn free_port() -> u16 {
     loop {

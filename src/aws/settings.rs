@@ -18,7 +18,7 @@ pub(super) struct Settings {
     pub region: Option<String>,
 }
 
-fn env_value(names: &[&str]) -> Option<String> {
+pub(super) fn env_value(names: &[&str]) -> Option<String> {
     names
         .iter()
         .find_map(|name| env::var(name).ok().filter(|v| !v.is_empty()))

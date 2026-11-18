@@ -2,7 +2,7 @@ use super::Settings;
 use std::{
     fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -74,10 +74,10 @@ pub(super) fn now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-struct Expiry {
+pub(super) struct Expiry {
     /// Validated timestamp text from the cache file (digits and separators only).
     text: String,
-    epoch: i64,
+    pub(super) epoch: i64,
     refreshable: bool,
 }
 
@@ -97,7 +97,7 @@ fn describe_expiry(expiry: Option<&Expiry>, now: i64) -> String {
     format!("{} ({} remaining{note})", expiry.text, duration(remaining))
 }
 
-fn duration(seconds: i64) -> String {
+pub(super) fn duration(seconds: i64) -> String {
     let minutes = seconds / 60;
     match (minutes / 60, minutes % 60) {
         (0, 0) => "less than 1m".into(),
@@ -113,7 +113,13 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
     // start URL for legacy profiles without an sso-session.
     let key = configured(profile, settings, "sso_session")
         .or_else(|| configured(profile, settings, "sso_start_url"))?;
-    let content = read_cache(&key)?;
+    cached_expiry(&key)
+}
+
+/// Reads the token cache for an sso-session name or legacy start URL.
+/// Any failure means "unknown". Never starts AWS CLI.
+pub(super) fn cached_expiry(key: &str) -> Option<Expiry> {
+    let content = read_cache(key)?;
     // The file also holds the access token; extract the timestamp only and
     // never print or log anything else from it.
     let text = json_string(&content, "expiresAt")?;
@@ -127,17 +133,32 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
 /// The AWS CLI SSO token cache file for an sso-session name (or legacy start URL).
 /// It holds the access token: callers must never print or log it.
 pub(super) fn read_cache(key: &str) -> Option<String> {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    let path = PathBuf::from(home)
+    let path = home()?
         .join(".aws/sso/cache")
         .join(format!("{}.json", sha1_hex(key.as_bytes())));
+    read_small(&path, MAX_BYTES)
+}
+
+pub(super) fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The whole file as text, or None when it is not a readable regular file of
+/// at most `max` bytes.
+pub(super) fn read_small(path: &Path, max: u64) -> Option<String> {
+    // Opening a FIFO or device could block; only regular files are read.
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
     let mut content = String::new();
     fs::File::open(path)
         .ok()?
-        .take(MAX_BYTES + 1)
+        .take(max + 1)
         .read_to_string(&mut content)
         .ok()?;
-    (content.len() as u64 <= MAX_BYTES).then_some(content)
+    (content.len() as u64 <= max).then_some(content)
 }
 
 fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> {
