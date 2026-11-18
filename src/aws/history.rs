@@ -7,67 +7,119 @@ use std::{
 const LIMIT: usize = 20;
 const MAX_BYTES: u64 = 64 * 1024;
 
-fn path() -> Option<PathBuf> {
-    std::env::var_os("TORA_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|s| !s.is_empty())
-                .map(|home| PathBuf::from(home).join(".tora"))
-        })
-        .map(|home| home.join("aws-profile-history"))
+/// A small most-recently-used list stored as one entry per line under `TORA_HOME`.
+pub(super) struct Store {
+    file: &'static str,
+    label: &'static str,
+    valid: fn(&str) -> bool,
 }
 
-fn read(path: &Path) -> Vec<String> {
-    let mut content = String::new();
-    let result =
-        fs::File::open(path).and_then(|file| file.take(MAX_BYTES + 1).read_to_string(&mut content));
-    if result.is_err() || content.len() as u64 > MAX_BYTES {
-        return Vec::new();
+/// Profiles shared by `aws sso`, `aws exec` and `aws ssm`.
+pub(super) const PROFILES: Store = Store {
+    file: "aws-profile-history",
+    label: "AWS profile",
+    valid: |profile| super::validate_profile(profile).is_ok(),
+};
+
+/// Session Manager targets, stored as `<profile>\t<instance-id>`.
+pub(super) const INSTANCES: Store = Store {
+    file: "aws-ssm-history",
+    label: "Session Manager",
+    valid: |entry| {
+        entry.split_once('\t').is_some_and(|(profile, target)| {
+            super::validate_profile(profile).is_ok() && super::ssm::valid_target(target)
+        })
+    },
+};
+
+impl Store {
+    fn path(&self) -> Option<PathBuf> {
+        std::env::var_os("TORA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|s| !s.is_empty())
+                    .map(|home| PathBuf::from(home).join(".tora"))
+            })
+            .map(|home| home.join(self.file))
     }
-    let mut profiles = Vec::new();
-    for profile in content.lines() {
-        if super::validate_profile(profile).is_ok() && !profiles.iter().any(|p| p == profile) {
-            profiles.push(profile.to_owned());
-            if profiles.len() == LIMIT {
-                break;
+
+    fn read(&self, path: &Path) -> Vec<String> {
+        let mut content = String::new();
+        let result = fs::File::open(path)
+            .and_then(|file| file.take(MAX_BYTES + 1).read_to_string(&mut content));
+        if result.is_err() || content.len() as u64 > MAX_BYTES {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        for entry in content.lines() {
+            if (self.valid)(entry) && !entries.iter().any(|e| e == entry) {
+                entries.push(entry.to_owned());
+                if entries.len() == LIMIT {
+                    break;
+                }
+            }
+        }
+        entries
+    }
+
+    /// Most recently used entries first.
+    pub(super) fn recent(&self) -> Vec<String> {
+        self.path().map(|path| self.read(&path)).unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path, entry: &str) -> io::Result<()> {
+        let mut recent = self.read(path);
+        recent.retain(|e| e != entry);
+        recent.insert(0, entry.to_owned());
+        recent.truncate(LIMIT);
+        let content = format!("{}\n", recent.join("\n"));
+        if content.len() as u64 > MAX_BYTES {
+            return Err(io::Error::other("history exceeds size limit"));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid history path"))?;
+        fs::create_dir_all(parent)?;
+        // Private, same-directory temporary file; readers only see complete snapshots.
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(content.as_bytes())?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    pub(super) fn remember(&self, entry: &str) {
+        if !(self.valid)(entry) {
+            return;
+        }
+        if let Some(path) = self.path() {
+            if let Err(error) = self.save(&path, entry) {
+                eprintln!("tora: could not save {} history: {error}", self.label);
             }
         }
     }
-    profiles
 }
 
-pub(super) fn sort(profiles: &mut [String]) {
-    let recent = path().map(|path| read(&path)).unwrap_or_default();
-    // Stable sort preserves AWS CLI order for profiles that have not been used.
-    profiles.sort_by_key(|profile| recent.iter().position(|p| p == profile).unwrap_or(LIMIT));
+/// Moves recently used items to the front, most recent first. Returns the number of
+/// items that appear in `recent`.
+pub(super) fn sort_by_recent<T>(
+    items: &mut [T],
+    recent: &[String],
+    key: impl Fn(&T) -> &str,
+) -> usize {
+    // Stable sort preserves the original order for items that have not been used.
+    items.sort_by_key(|item| recent.iter().position(|r| r == key(item)).unwrap_or(LIMIT));
+    items
+        .iter()
+        .take_while(|item| recent.iter().any(|r| r == key(item)))
+        .count()
 }
 
-fn save(path: &Path, profile: &str) -> io::Result<()> {
-    let mut recent = read(path);
-    recent.retain(|p| p != profile);
-    recent.insert(0, profile.to_owned());
-    recent.truncate(LIMIT);
-    let content = format!("{}\n", recent.join("\n"));
-    if content.len() as u64 > MAX_BYTES {
-        return Err(io::Error::other("profile history exceeds size limit"));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("invalid history path"))?;
-    fs::create_dir_all(parent)?;
-    // Private, same-directory temporary file; readers only see complete snapshots.
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(content.as_bytes())?;
-    file.persist(path).map_err(|error| error.error)?;
-    Ok(())
+pub(super) fn sort(profiles: &mut [String]) -> usize {
+    sort_by_recent(profiles, &PROFILES.recent(), |p| p)
 }
 
 pub(super) fn remember(profile: &str) {
-    if let Some(path) = path() {
-        if let Err(error) = save(&path, profile) {
-            eprintln!("tora: could not save AWS profile history: {error}");
-        }
-    }
+    PROFILES.remember(profile);
 }

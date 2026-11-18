@@ -31,6 +31,19 @@ if [ "$1" = configure ]; then
   printf '%s' "$PROFILES"
   exit "${LIST_STATUS:-0}"
 fi
+if [ "$1" = ssm ] && [ "$2" = describe-instance-information ]; then
+  printf '%s' "$SSM_INSTANCES"
+  exit "${SSM_STATUS:-0}"
+fi
+if [ "$1" = ec2 ]; then
+  printf '%s' "$EC2_NAMES"
+  [ -n "$EC2_STATUS" ] && printf 'AccessDenied\n' >&2
+  exit "${EC2_STATUS:-0}"
+fi
+if [ "$1" = ssm ] && [ "$2" = start-session ]; then
+  printf 'session:%s:%s:%s\n' "$AWS_PROFILE" "$4" "${AWS_ACCESS_KEY_ID-unset}"
+  exit "${SESSION_STATUS:-0}"
+fi
 if [ "$1" = sts ]; then
   if [ -n "$AWS_ACCESS_KEY_ID$AWS_SECRET_ACCESS_KEY$AWS_SESSION_TOKEN$AWS_SECURITY_TOKEN$AWS_DEFAULT_PROFILE" ]; then
     printf 'credential environment was not cleared\n' >&2
@@ -44,6 +57,7 @@ printf 'login profile: %s\n' "$AWS_PROFILE" >&2
 exit "${LOGIN_STATUS:-0}"
 "#,
         );
+        fixture.script("session-manager-plugin", "#!/bin/sh\n");
         fixture.script("shell", r#"#!/bin/sh
 printf 'shell:%s:%s\n' "$1" "$AWS_PROFILE"
 printf 'credentials:%s:%s:%s:%s:%s\n' "${AWS_ACCESS_KEY_ID-unset}" "${AWS_SECRET_ACCESS_KEY-unset}" "${AWS_SESSION_TOKEN-unset}" "${AWS_SECURITY_TOKEN-unset}" "${AWS_DEFAULT_PROFILE-unset}"
@@ -82,7 +96,17 @@ exit "${SHELL_STATUS:-0}"
             .env_remove("CHECK_ERROR")
             .env_remove("LIST_STATUS")
             .env_remove("LOGIN_STATUS")
-            .env_remove("SHELL_STATUS");
+            .env_remove("SHELL_STATUS")
+            .env(
+                "SSM_INSTANCES",
+                "i-0bbb\tConnectionLost\tUbuntu\tip-10-0-0-2\n\
+                 i-0aaa\tOnline\tAmazon Linux\tip-10-0-0-1\n\
+                 mi-0ccc\tOnline\tWindows\tonprem\n",
+            )
+            .env("EC2_NAMES", "i-0aaa\tweb\ni-0bbb\tNone\n")
+            .env_remove("SSM_STATUS")
+            .env_remove("EC2_STATUS")
+            .env_remove("SESSION_STATUS");
         command
     }
 
@@ -633,4 +657,212 @@ fn search_with_no_matches_can_reset_or_enter_custom_profile() {
     let output = f.input(&["sso", "--export"], "/missing\n0\ncustom\n");
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='custom'"));
+}
+
+fn ssm_calls(f: &Fixture) -> Vec<String> {
+    f.calls()
+        .lines()
+        .filter(|line| {
+            matches!(
+                *line,
+                "sts"
+                    | "describe-instance-information"
+                    | "describe-instances"
+                    | "start-session"
+                    | "login"
+            )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn ssm_lists_named_instances_and_starts_selected_session() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["ssm", "dev"])
+        .env("CHECK_STATUS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(b"/web\n1\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    // Online first and sorted by name; EC2 Name tags replace computer names.
+    let menu = err.split("Enter number").next().unwrap();
+    let web = menu.find("web").unwrap();
+    let onprem = menu.find("onprem").unwrap();
+    let lost = menu.find("ip-10-0-0-2").unwrap();
+    assert!(onprem < web && web < lost, "{menu}");
+    assert!(!err.contains("last used"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "session:dev:i-0aaa:unset\n"
+    );
+    assert_eq!(
+        ssm_calls(&f),
+        [
+            "sts",
+            "describe-instance-information",
+            "describe-instances",
+            "start-session"
+        ]
+    );
+    assert!(
+        f.calls()
+            .contains("Name=instance-id,Values=i-0bbb,i-0aaa\n")
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-ssm-history")).unwrap(),
+        "dev\ti-0aaa\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-profile-history")).unwrap(),
+        "dev\n"
+    );
+}
+
+#[test]
+fn ssm_marks_last_used_instance_per_profile_and_puts_it_first() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-ssm-history"),
+        "other\tmi-0ccc\ndev\ti-0bbb\ndev\ti-0aaa\ndev\ti-gone\n",
+    )
+    .unwrap();
+    let output = f.input(&["ssm", "dev"], "1\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("  ")).collect();
+    assert!(
+        lines[0].contains("i-0bbb") && lines[0].ends_with("(last used)"),
+        "{err}"
+    );
+    assert!(
+        lines[1].contains("i-0aaa") && lines[1].ends_with("(recent)"),
+        "{err}"
+    );
+    assert!(
+        lines[2].contains("mi-0ccc") && !lines[2].contains('('),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0bbb:"));
+}
+
+#[test]
+fn ssm_explicit_target_skips_listing() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["ssm", "dev", "--target", "i-0123", "--no-browser"])
+        .env("SESSION_STATUS", "5")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(ssm_calls(&f), ["sts", "login", "start-session"]);
+    assert!(f.calls().contains("--no-browser\n"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "session:dev:i-0123:unset\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-ssm-history")).unwrap(),
+        "dev\ti-0123\n"
+    );
+}
+
+#[test]
+fn ssm_reuses_current_profile() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["ssm", "-t", "i-1"])
+        .env("AWS_PROFILE", "current")
+        .env("CHECK_STATUS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:current:i-1:"));
+}
+
+#[test]
+fn ssm_rejects_missing_plugin_and_invalid_target_before_aws() {
+    let f = Fixture::new();
+    fs::remove_file(f.0.join("session-manager-plugin")).unwrap();
+    let output = f.command(&["ssm", "dev"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("session-manager-plugin not found"));
+    assert!(f.calls().is_empty());
+    let f = Fixture::new();
+    for target in ["--profile", "i 1"] {
+        let output = f
+            .command(&["ssm", "dev", &format!("--target={target}")])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid Session Manager target"));
+    }
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn ssm_handles_empty_list_name_lookup_failure_and_cancel() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["ssm", "dev"])
+        .env("CHECK_STATUS", "0")
+        .env("SSM_INSTANCES", "")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no Session Manager managed instances")
+    );
+    assert!(!f.calls().contains("describe-instances"));
+
+    let f = Fixture::new();
+    let mut command = f.command(&["ssm", "dev"]);
+    command.env("CHECK_STATUS", "0").env("EC2_STATUS", "254");
+    let output = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"/ip-10-0-0-1\n1\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(err.contains("could not read EC2 Name tags") && err.contains("AccessDenied"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0aaa:"));
+
+    let f = Fixture::new();
+    for input in ["q\n", ""] {
+        let output = f.input(&["ssm", "dev"], input);
+        assert!(!output.status.success());
+        assert!(!f.calls().contains("start-session"));
+        assert!(!f.0.join("tora/aws-ssm-history").exists());
+    }
+}
+
+#[test]
+fn profile_menu_marks_last_used_profile() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(f.0.join("tora/aws-profile-history"), "dev\ndefault\n").unwrap();
+    let output = f.input(&["sso", "--export"], "1\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("  1. dev  (last used)\n"), "{err}");
+    assert!(err.contains("  2. default  (recent)\n"), "{err}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("export AWS_PROFILE='dev'"));
 }

@@ -31,6 +31,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
+| EC2 にログインする | `tora aws ssm` | インスタンスを選んで Session Manager で接続（前回の接続先を表示） |
 | 最新版に更新する | `tora update` | 配布バイナリを検証して自己更新 |
 | コマンド入力を楽にする | `tora completion install` | シェルを判定して補完を設定 |
 
@@ -41,6 +42,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 - [シェル補完](#シェル補完)
 - [AWS プロファイルと SSO](#aws-プロファイルと-sso)
 - [プロファイルを指定してコマンドを実行](#プロファイルを指定してコマンドを実行)
+- [Session Manager でインスタンスに接続](#session-manager-でインスタンスに接続)
 - [開発](#開発)
 - [リリース](#リリース)
 
@@ -192,8 +194,9 @@ exit                              # 元のシェルに戻る
 
 SSO の認証確認またはログイン成功時と `aws exec` の実行直前に、選択したプロファイル名を
 `$TORA_HOME/aws-profile-history`（既定は `~/.tora/aws-profile-history`）へ保存します。
-直近20件を保持し、選択メニューでは最近使った設定済みプロファイルを上に表示します。
-履歴は SSO と exec で共通です。設定から削除した名前は一覧に追加しません。
+直近20件を保持し、選択メニューでは最近使った設定済みプロファイルを上に表示し、
+前回のものに `(last used)`、それ以外の履歴に `(recent)` を付けます。
+履歴は SSO・exec・ssm で共通です。設定から削除した名前は一覧に追加しません。
 `aws profiles` の出力順は変わりません。履歴に認証情報は保存しません。
 履歴の読み取りに失敗した場合は通常の一覧順で表示し、保存に失敗しても処理を続けます。
 履歴ファイルを削除すると履歴をリセットできます。
@@ -262,6 +265,40 @@ tora aws exec -- terraform plan    # プロファイルを検索・選択して�
 既存の認証情報を使い、自動で SSO ログインは行いません。
 必要なら先に `tora aws sso dev --no-shell` を実行してください。
 パイプ入力を子コマンドへ渡す場合は、プロファイルを明示して選択操作を省略してください。
+
+## Session Manager でインスタンスに接続
+
+```sh
+tora aws ssm                       # プロファイル → インスタンスを選んで接続
+tora aws ssm dev                   # プロファイルを指定してインスタンスを選択
+tora aws ssm dev -t i-0123456789abcdef0   # 接続先を指定（一覧取得を省略）
+```
+
+```text
+? Instance (Esc/q to cancel) ›
+❯ batch-worker  i-0bbb222  Online          Amazon Linux  (last used)
+  web-1         i-0aaa111  Online          Amazon Linux  (recent)
+  bastion       i-0ccc333  ConnectionLost  Ubuntu
+  Search instances
+```
+
+AWS CLI v2 に加えて [Session Manager プラグイン](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+（`session-manager-plugin`）が必要です。見つからない場合はログイン前に停止します。
+プロファイルの決定と認証は `tora aws sso` と同じで、認証情報が有効ならログインを省略し、
+必要な場合だけ SSO ログインします（`--select` / `--no-browser` / `--use-device-code` も同様）。
+
+一覧は `aws ssm describe-instance-information` で取得した Session Manager 管理下の
+インスタンスです。EC2 の `Name` タグを `aws ec2 describe-instances` で補い、
+取得できない場合はホスト名を表示します。Online のものを先に、名前順で並べます。
+
+接続したインスタンスはプロファイルごとに `$TORA_HOME/aws-ssm-history` へ保存し
+（直近20件）、次回はそのプロファイルで最近使ったものを上に表示します。
+前回の接続先に `(last used)`、それ以前の接続先に `(recent)` を付け、Enter だけで再接続できます。
+「Search instances」で名前・ID・プラットフォームを部分一致検索できます。
+標準入力がターミナルでない場合は番号選択（`/text` で検索、`q` でキャンセル）になります。
+
+接続は `aws ssm start-session --target ...` にプロセスを置き換えて行うため、
+終了コードやシグナルもそのまま伝わります。
 
 ## 開発
 

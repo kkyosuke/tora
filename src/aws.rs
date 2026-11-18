@@ -1,4 +1,5 @@
 mod history;
+mod ssm;
 
 use crate::cli::AwsCommands;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -43,40 +44,9 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             no_browser,
             use_device_code,
         } => {
-            let profile = profile.or_else(|| {
-                if select {
-                    None
-                } else {
-                    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
-                        .into_iter()
-                        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-                }
-            });
+            let profile = profile.or_else(|| current_profile(select));
             let profile = resolve_profile(profile)?;
-            if credentials_valid(&profile)? {
-                eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
-            } else {
-                eprintln!("Logging in with AWS profile {profile:?}...");
-                let mut command = profile_command(&profile);
-                command.args(["sso", "login", "--profile", &profile]);
-                if no_browser {
-                    command.arg("--no-browser");
-                }
-                if use_device_code {
-                    command.arg("--use-device-code");
-                }
-                // Preserve browser/device login interaction while keeping stdout safe to eval.
-                let status = command
-                    .stdout(Stdio::from(io::stderr()))
-                    .status()
-                    .map_err(aws_error)?;
-                if !status.success() {
-                    return Err(io::Error::other(format!(
-                        "aws sso login failed for profile {profile:?}: {status}"
-                    )));
-                }
-                eprintln!("SSO login completed for profile {profile:?}.");
-            }
+            ensure_login(&profile, no_browser, use_device_code)?;
             history::remember(&profile);
             if export {
                 writeln!(io::stdout().lock(), "{}", export_statement(&profile))?;
@@ -88,7 +58,74 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             }
             Ok(())
         }
+        AwsCommands::Ssm {
+            profile,
+            target,
+            select,
+            no_browser,
+            use_device_code,
+        } => ssm::run(
+            profile.or_else(|| current_profile(select)),
+            target,
+            no_browser,
+            use_device_code,
+        ),
     }
+}
+
+/// AWS_PROFILE / AWS_DEFAULT_PROFILE unless an interactive selection was requested.
+fn current_profile(select: bool) -> Option<String> {
+    if select {
+        return None;
+    }
+    ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
+/// Reuses valid credentials and only runs `aws sso login` when they are missing or expired.
+fn ensure_login(profile: &str, no_browser: bool, use_device_code: bool) -> io::Result<()> {
+    if credentials_valid(profile)? {
+        eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
+        return Ok(());
+    }
+    eprintln!("Logging in with AWS profile {profile:?}...");
+    let mut command = profile_command(profile);
+    command.args(["sso", "login", "--profile", profile]);
+    if no_browser {
+        command.arg("--no-browser");
+    }
+    if use_device_code {
+        command.arg("--use-device-code");
+    }
+    // Preserve browser/device login interaction while keeping stdout safe to eval.
+    let status = command
+        .stdout(Stdio::from(io::stderr()))
+        .status()
+        .map_err(aws_error)?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "aws sso login failed for profile {profile:?}: {status}"
+        )));
+    }
+    eprintln!("SSO login completed for profile {profile:?}.");
+    Ok(())
+}
+
+/// Display suffix that shows which items were used before.
+fn recent_marker(index_in_recent: Option<usize>) -> &'static str {
+    match index_in_recent {
+        Some(0) => "  (last used)",
+        Some(_) => "  (recent)",
+        None => "",
+    }
+}
+
+fn profile_label(profile: &str, recent: &[String]) -> String {
+    format!(
+        "{profile}{}",
+        recent_marker(recent.iter().position(|r| r == profile))
+    )
 }
 
 // Static credentials take precedence over AWS_PROFILE. Remove them only in the
@@ -178,11 +215,17 @@ fn resolve_profile(profile: Option<String>) -> io::Result<String> {
         Some(profile) => profile,
         None => {
             let mut profiles = profiles()?;
-            history::sort(&mut profiles);
+            let used = history::sort(&mut profiles);
+            let recent = profiles[..used].to_vec();
             if io::stdin().is_terminal() && io::stderr().is_terminal() {
-                select_terminal_profile(&profiles)?
+                select_terminal_profile(&profiles, &recent)?
             } else {
-                select_profile(&profiles, &mut io::stdin().lock(), &mut io::stderr().lock())?
+                select_profile(
+                    &profiles,
+                    &recent,
+                    &mut io::stdin().lock(),
+                    &mut io::stderr().lock(),
+                )?
             }
         }
     };
@@ -199,11 +242,11 @@ fn filtered_profiles(profiles: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
-fn select_terminal_profile(profiles: &[String]) -> io::Result<String> {
+fn select_terminal_profile(profiles: &[String], recent: &[String]) -> io::Result<String> {
     let theme = ColorfulTheme::default();
     let mut visible = profiles.to_vec();
     while !profiles.is_empty() {
-        let mut items = visible.clone();
+        let mut items: Vec<String> = visible.iter().map(|p| profile_label(p, recent)).collect();
         items.push("Type a custom profile".into());
         items.push("Search profiles".into());
         let selection = Select::with_theme(&theme)
@@ -309,6 +352,7 @@ fn read_line(input: &mut impl BufRead) -> io::Result<String> {
 
 fn select_profile(
     profiles: &[String],
+    recent: &[String],
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> io::Result<String> {
@@ -322,7 +366,12 @@ fn select_profile(
         } else {
             writeln!(output, "Select AWS profile:")?;
             for (index, profile) in visible.iter().enumerate() {
-                writeln!(output, "  {}. {profile}", index + 1)?;
+                writeln!(
+                    output,
+                    "  {}. {}",
+                    index + 1,
+                    profile_label(profile, recent)
+                )?;
             }
             writeln!(output, "  0. Type a custom profile")?;
         }
@@ -372,7 +421,7 @@ mod tests {
         let mut output = Vec::new();
         let profiles = vec!["default".into(), "dev".into()];
         assert_eq!(
-            select_profile(&profiles, &mut input, &mut output).unwrap(),
+            select_profile(&profiles, &[], &mut input, &mut output).unwrap(),
             "dev"
         );
     }
@@ -381,7 +430,7 @@ mod tests {
     fn zero_selects_custom_and_empty_names_retry() {
         let mut input = &b"0\n\n0\ncustom\n"[..];
         assert_eq!(
-            select_profile(&["dev".into()], &mut input, &mut Vec::new()).unwrap(),
+            select_profile(&["dev".into()], &[], &mut input, &mut Vec::new()).unwrap(),
             "custom"
         );
     }
@@ -389,7 +438,7 @@ mod tests {
     #[test]
     fn empty_list_allows_manual_input() {
         assert_eq!(
-            select_profile(&[], &mut &b"manual\n"[..], &mut Vec::new()).unwrap(),
+            select_profile(&[], &[], &mut &b"manual\n"[..], &mut Vec::new()).unwrap(),
             "manual"
         );
     }
@@ -397,7 +446,9 @@ mod tests {
     #[test]
     fn eof_and_cancel_abort() {
         for input in [&b""[..], &b"q\n"[..]] {
-            assert!(select_profile(&["dev".into()], &mut &input[..], &mut Vec::new()).is_err());
+            assert!(
+                select_profile(&["dev".into()], &[], &mut &input[..], &mut Vec::new()).is_err()
+            );
         }
     }
 
