@@ -22,7 +22,7 @@ fn executable(path: &Path) -> bool {
     }
 }
 
-fn on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
         .map(|dir| dir.join(name))
         .find(|path| executable(path))

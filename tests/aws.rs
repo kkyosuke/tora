@@ -1081,7 +1081,7 @@ fn ssm_marks_last_used_instance_per_profile_and_puts_it_first() {
     fs::create_dir(f.0.join("tora")).unwrap();
     fs::write(
         f.0.join("tora/aws-ssm-history"),
-        "other\tmi-0ccc\ndev\ti-0bbb\ndev\ti-0aaa\ndev\ti-gone\n",
+        "other\ti-0aaa\ndev\tmi-0ccc\ndev\ti-0aaa\ndev\ti-gone\n",
     )
     .unwrap();
     let output = f.input(&["ssm", "dev"], "1\n");
@@ -1089,7 +1089,7 @@ fn ssm_marks_last_used_instance_per_profile_and_puts_it_first() {
     assert!(output.status.success(), "{err}");
     let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("  ")).collect();
     assert!(
-        lines[0].contains("i-0bbb") && lines[0].ends_with("(last used)"),
+        lines[0].contains("mi-0ccc") && lines[0].ends_with("(last used)"),
         "{err}"
     );
     assert!(
@@ -1097,10 +1097,10 @@ fn ssm_marks_last_used_instance_per_profile_and_puts_it_first() {
         "{err}"
     );
     assert!(
-        lines[2].contains("mi-0ccc") && !lines[2].contains('('),
+        lines[2].contains("i-0bbb") && !lines[2].contains('('),
         "{err}"
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0bbb:"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:mi-0ccc:"));
 }
 
 #[test]
@@ -1200,6 +1200,8 @@ fn ssm_handles_empty_list_name_lookup_failure_and_cancel() {
         assert!(!output.status.success());
         assert!(!f.calls().contains("start-session"));
         assert!(!f.0.join("tora/aws-ssm-history").exists());
+        // A cancelled selection must not make the profile "last used" either.
+        assert!(!f.0.join("tora/aws-profile-history").exists());
     }
 }
 
@@ -1266,4 +1268,60 @@ fn ssm_rejects_instance_id_as_profile() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("use --target i-0123456789abcdef0"));
     assert!(f.calls().is_empty());
+}
+
+#[test]
+fn ssm_offline_last_used_stays_marked_below_online_instances() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(f.0.join("tora/aws-ssm-history"), "dev\ti-0bbb\n").unwrap();
+    let output = f.input(&["ssm", "dev"], "q\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("  ")).collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(
+        lines[0].contains("mi-0ccc") && lines[0].contains("Online"),
+        "{err}"
+    );
+    assert!(lines[1].contains("web"), "{err}");
+    assert!(
+        lines[2].contains("i-0bbb") && lines[2].ends_with("(last used)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn ssm_history_survives_many_profiles() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    let history: String = (0..15)
+        .flat_map(|p| (0..20).map(move |i| format!("profile-{p}\ti-{i:04}\n")))
+        .collect();
+    fs::write(f.0.join("tora/aws-ssm-history"), &history).unwrap();
+    let output = f
+        .command(&["ssm", "dev", "-t", "i-new"])
+        .env("CHECK_STATUS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let saved = fs::read_to_string(f.0.join("tora/aws-ssm-history")).unwrap();
+    assert_eq!(saved.lines().count(), 301);
+    assert!(saved.ends_with("profile-14\ti-0019\n"));
+}
+
+#[test]
+fn ssm_accepts_instance_like_profile_from_environment() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["ssm", "-t", "i-0aaa"])
+        .env("AWS_PROFILE", "i-0123abcd")
+        .env("CHECK_STATUS", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:i-0123abcd:i-0aaa:"));
 }

@@ -445,14 +445,16 @@ AWS CLI v2 に加えて [Session Manager プラグイン](https://docs.aws.amazo
 
 一覧には `aws ssm describe-instance-information` で取得した、Session Manager 管理下の
 インスタンスを表示します。EC2 の `Name` タグは `aws ec2 describe-instances` で補い、
-取得できない場合はホスト名を表示します。Online のものを先にして名前順に並べます。
+取得できない場合はホスト名を表示します。Online のものを先にして名前順（大文字・小文字を区別せず、名前なしは最後）に並べます。
 「Search instances」で名前・ID・プラットフォームを部分一致検索できます。
 標準入力がターミナルでない場合は番号選択（`/text` で検索、`q` でキャンセル）になります。
 
 接続先は `$TORA_HOME/aws-ssm-history` に、プロファイルごとに直近20件まで保存します。
-次回はそのプロファイルで最近使ったものを上に表示し、直前の接続先に `(last used)`、
-それ以前の接続先に `(recent)` を付けるため、Enter だけで再接続できます。
+次回は Online のものと Online 以外のものそれぞれで、最近使ったものを上に表示します。
+直前の接続先に `(last used)`、それ以前の接続先に `(recent)` を付けるため、
+直前の接続先が Online なら Enter だけで再接続できます。
 直前の接続先がすでに存在しない場合は、`(last used)` を付けません。
+プロファイルと接続先の履歴は、セッションを開始する直前に保存します（選択をキャンセルした場合は保存しません）。
 
 接続時は tora のプロセスを `aws ssm start-session --target ...` に置き換えるため、
 終了コードやシグナルもそのまま伝わります。番号選択で標準入力から読み込んだ残りの入力は

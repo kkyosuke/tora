@@ -27,14 +27,21 @@ pub(super) const PROFILES: Store = Store {
 pub(super) const INSTANCES: Store = Store {
     file: "aws-ssm-history",
     label: "Session Manager",
-    limit: 200,
+    // No global count limit: entries are capped per profile, and the oldest entries are
+    // dropped only if the file would exceed MAX_BYTES.
+    limit: usize::MAX,
     valid: |entry| {
-        entry.split_once('\t').is_some_and(|(profile, target)| {
+        split_instance(entry).is_some_and(|(profile, target)| {
             super::validate_profile(profile).is_ok() && super::ssm::valid_target(target)
         })
     },
 };
 pub(super) const INSTANCES_PER_PROFILE: usize = 20;
+
+/// Splits a Session Manager history entry into `(profile, target)`.
+pub(super) fn split_instance(entry: &str) -> Option<(&str, &str)> {
+    entry.split_once('\t')
+}
 
 impl Store {
     fn path(&self) -> Option<PathBuf> {
@@ -81,7 +88,12 @@ impl Store {
             }
         }
         kept.truncate(self.limit);
-        let content = format!("{}\n", kept.join("\n"));
+        let mut content = format!("{}\n", kept.join("\n"));
+        // Drop the oldest entries rather than refusing to record the newest one.
+        while content.len() as u64 > MAX_BYTES && kept.len() > 1 {
+            kept.pop();
+            content = format!("{}\n", kept.join("\n"));
+        }
         if content.len() as u64 > MAX_BYTES {
             return Err(io::Error::other("history exceeds size limit"));
         }
@@ -115,7 +127,7 @@ impl Store {
 /// Saves a target and keeps at most [`INSTANCES_PER_PROFILE`] entries for each profile,
 /// so frequent use of one profile does not push out another profile's history.
 pub(super) fn remember_instance(profile: &str, target: &str) {
-    let key = |entry: &str| entry.split_once('\t').map(|(p, _)| p.to_owned());
+    let key = |entry: &str| split_instance(entry).map(|(p, _)| p.to_owned());
     INSTANCES.remember_with(&format!("{profile}\t{target}"), |kept, entry| {
         let profile = key(entry);
         kept.iter().filter(|e| key(e) == profile).count() < INSTANCES_PER_PROFILE

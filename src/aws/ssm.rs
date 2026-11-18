@@ -1,10 +1,8 @@
 use super::{Settings, history};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, BufRead, IsTerminal, Write},
-    path::Path,
-    process::Stdio,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -30,11 +28,15 @@ impl Instance {
     }
 
     /// Search covers what the user sees as data, not padding or history markers.
+    /// `query` must already be lowercase.
     fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
         [&self.name, &self.id, &self.platform]
             .iter()
-            .any(|field| field.to_lowercase().contains(&query))
+            .any(|field| field.to_lowercase().contains(query))
+    }
+
+    fn online(&self) -> bool {
+        self.status == "Online"
     }
 }
 
@@ -48,13 +50,8 @@ pub(super) fn run(
     if let Some(target) = &target {
         check_target(target)?;
     }
-    if let Some(profile) = profile.as_deref().filter(|p| looks_like_instance_id(p)) {
-        return Err(io::Error::other(format!(
-            "{profile:?} looks like an instance ID, not a profile; use --target {profile}"
-        )));
-    }
     // Fail before any login or selection when the session could never start.
-    if !plugin_installed() {
+    if crate::doctor::on_path(PLUGIN).is_none() {
         return Err(io::Error::other(format!(
             "{PLUGIN} not found in PATH; install the Session Manager plugin for AWS CLI first \
              (https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)"
@@ -62,7 +59,6 @@ pub(super) fn run(
     }
     let profile = super::resolve_profile(profile, settings)?;
     super::ensure_login(&profile, settings, no_browser, use_device_code)?;
-    history::remember(&profile);
 
     let target = match target {
         Some(target) => target,
@@ -76,6 +72,9 @@ pub(super) fn run(
             }
             let recent = recent_targets(&profile);
             history::sort_by_recent(&mut instances, &recent, |i| &i.id);
+            // Recent instances lead within each group, but Online instances stay first so
+            // the default selection is never an unreachable instance when one is online.
+            instances.sort_by_key(|i| !i.online());
             let labels = labels(&instances, &recent);
             let index = if io::stdin().is_terminal() && io::stderr().is_terminal() {
                 select_terminal(&instances, &labels)?
@@ -90,6 +89,8 @@ pub(super) fn run(
             instances.swap_remove(index).id
         }
     };
+    // Record history only once a session is actually about to start (not on cancel).
+    history::remember(&profile);
     history::remember_instance(&profile, &target);
 
     eprintln!("Starting Session Manager session on {target} with profile {profile:?}...");
@@ -128,6 +129,16 @@ fn check_target(target: &str) -> io::Result<()> {
     }
 }
 
+/// Rejects a positional profile argument that is really an instance ID, before any AWS call.
+pub(super) fn check_profile_argument(profile: Option<&str>) -> io::Result<()> {
+    match profile.filter(|p| looks_like_instance_id(p)) {
+        Some(profile) => Err(io::Error::other(format!(
+            "{profile:?} looks like an instance ID, not a profile; use --target {profile}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// EC2 (`i-`) and managed node (`mi-`) IDs: a prefix and 8 or 17 hex digits.
 fn looks_like_instance_id(value: &str) -> bool {
     ["i-", "mi-"].iter().any(|prefix| {
@@ -137,32 +148,13 @@ fn looks_like_instance_id(value: &str) -> bool {
     })
 }
 
-fn plugin_installed() -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(PLUGIN)))
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file() || path.with_extension("exe").is_file()
-    }
-}
-
 /// Targets used with this profile, most recent first.
 fn recent_targets(profile: &str) -> Vec<String> {
     history::INSTANCES
         .recent()
         .into_iter()
         .filter_map(|entry| {
-            let (p, target) = entry.split_once('\t')?;
+            let (p, target) = history::split_instance(&entry)?;
             (p == profile).then(|| target.to_owned())
         })
         .collect()
@@ -173,7 +165,6 @@ fn text_query(profile: &str, settings: &Settings, args: &[&str]) -> io::Result<S
         .profile_command(profile)
         .args(args)
         .args(["--output", "text"])
-        .stderr(Stdio::piped())
         .output()
         .map_err(super::aws_error)?;
     if !output.status.success() {
@@ -232,11 +223,20 @@ fn list_instances(profile: &str, settings: &Settings) -> io::Result<Vec<Instance
             instance.name = name;
         }
     }
-    // Online instances first, then by name, so the list is stable between runs.
-    instances.sort_by(|a, b| {
-        (a.status != "Online", &a.name, &a.id).cmp(&(b.status != "Online", &b.name, &b.id))
-    });
+    sort_instances(&mut instances);
     Ok(instances)
+}
+
+/// Online first, then case-insensitive name order with unnamed instances last.
+fn sort_instances(instances: &mut [Instance]) {
+    instances.sort_by_cached_key(|i| {
+        (
+            !i.online(),
+            i.name.is_empty(),
+            i.name.to_lowercase(),
+            i.id.clone(),
+        )
+    });
 }
 
 /// Characters that can reorder or hide text in a terminal: controls, bidirectional
@@ -270,10 +270,11 @@ fn field(value: Option<&str>) -> String {
 
 fn parse_instances(output: &str) -> Vec<Instance> {
     let mut instances: Vec<Instance> = Vec::new();
+    let mut seen = HashSet::new();
     for line in output.lines() {
         let mut fields = line.split('\t');
         let id = field(fields.next());
-        if !valid_target(&id) || instances.iter().any(|i| i.id == id) {
+        if !valid_target(&id) || !seen.insert(id.clone()) {
             continue;
         }
         let status = field(fields.next());
@@ -326,8 +327,9 @@ fn labels(instances: &[Instance], recent: &[String]) -> Vec<String> {
 }
 
 fn filtered(instances: &[Instance], query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
     (0..instances.len())
-        .filter(|&i| instances[i].matches(query))
+        .filter(|&i| instances[i].matches(&query))
         .collect()
 }
 
@@ -498,6 +500,19 @@ mod tests {
         for target in ["", "-i", "--profile", "i 1", "i-1\n", "i-1;rm"] {
             assert!(!valid_target(target), "{target:?}");
         }
+    }
+
+    #[test]
+    fn sorts_online_then_case_insensitive_names_with_unnamed_last() {
+        let mut instances = vec![
+            instance("i-1", "", "Online"),
+            instance("i-2", "web", "Online"),
+            instance("i-3", "Api", "ConnectionLost"),
+            instance("i-4", "Db", "Online"),
+        ];
+        sort_instances(&mut instances);
+        let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["i-4", "i-2", "i-1", "i-3"]);
     }
 
     #[test]

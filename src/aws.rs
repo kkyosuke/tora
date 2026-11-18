@@ -104,6 +104,9 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             no_browser,
             use_device_code,
         } => {
+            // Only the positional argument can be a mistyped instance ID; environment and
+            // saved defaults are real profile names.
+            ssm::check_profile_argument(profile.as_deref())?;
             let profile = if select {
                 None
             } else {
