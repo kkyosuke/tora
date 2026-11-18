@@ -2,6 +2,7 @@ mod history;
 mod settings;
 mod ssm;
 mod status;
+mod sync;
 
 use settings::Settings;
 
@@ -114,6 +115,24 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             };
             ssm::run(profile, target, &settings, no_browser, use_device_code)
         }
+        AwsCommands::Sync {
+            sso_session,
+            region,
+            dry_run,
+            yes,
+            no_browser,
+            use_device_code,
+        } => sync::run(
+            sync::Options {
+                sso_session,
+                region,
+                dry_run,
+                yes,
+                no_browser,
+                use_device_code,
+            },
+            &settings,
+        ),
         AwsCommands::Status { profile } => {
             let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;
             status::run(&profile, &settings)
@@ -171,9 +190,25 @@ fn ensure_login(
         eprintln!("AWS credentials are valid for profile {profile:?}; skipping login.");
         return Ok(());
     }
-    eprintln!("Logging in with AWS profile {profile:?}...");
-    let mut command = settings.profile_command(profile);
-    command.args(["sso", "login", "--profile", profile]);
+    sso_login(
+        settings.profile_command(profile),
+        &["--profile", profile],
+        &format!("profile {profile:?}"),
+        no_browser,
+        use_device_code,
+    )
+}
+
+/// Runs `aws sso login` for `target` (`--profile NAME` or `--sso-session NAME`).
+fn sso_login(
+    mut command: Command,
+    target: &[&str],
+    label: &str,
+    no_browser: bool,
+    use_device_code: bool,
+) -> io::Result<()> {
+    eprintln!("Logging in with AWS {label}...");
+    command.args(["sso", "login"]).args(target);
     if no_browser {
         command.arg("--no-browser");
     }
@@ -187,10 +222,10 @@ fn ensure_login(
         .map_err(aws_error)?;
     if !status.success() {
         return Err(io::Error::other(format!(
-            "aws sso login failed for profile {profile:?}: {status}"
+            "aws sso login failed for {label}: {status}"
         )));
     }
-    eprintln!("SSO login completed for profile {profile:?}.");
+    eprintln!("SSO login completed for {label}.");
     Ok(())
 }
 

@@ -68,7 +68,7 @@ fn login_hint(profile: &str) -> String {
     format!("run `tora aws sso{argument}` to log in")
 }
 
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
@@ -113,6 +113,20 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
     // start URL for legacy profiles without an sso-session.
     let key = configured(profile, settings, "sso_session")
         .or_else(|| configured(profile, settings, "sso_start_url"))?;
+    let content = read_cache(&key)?;
+    // The file also holds the access token; extract the timestamp only and
+    // never print or log anything else from it.
+    let text = json_string(&content, "expiresAt")?;
+    Some(Expiry {
+        epoch: parse_timestamp(text)?,
+        text: text.to_owned(),
+        refreshable: json_string(&content, "refreshToken").is_some(),
+    })
+}
+
+/// The AWS CLI SSO token cache file for an sso-session name (or legacy start URL).
+/// It holds the access token: callers must never print or log it.
+pub(super) fn read_cache(key: &str) -> Option<String> {
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
     let path = PathBuf::from(home)
         .join(".aws/sso/cache")
@@ -123,17 +137,7 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
         .take(MAX_BYTES + 1)
         .read_to_string(&mut content)
         .ok()?;
-    if content.len() as u64 > MAX_BYTES {
-        return None;
-    }
-    // The file also holds the access token; extract the timestamp only and
-    // never print or log anything else from it.
-    let text = json_string(&content, "expiresAt")?;
-    Some(Expiry {
-        epoch: parse_timestamp(text)?,
-        text: text.to_owned(),
-        refreshable: json_string(&content, "refreshToken").is_some(),
-    })
+    (content.len() as u64 <= MAX_BYTES).then_some(content)
 }
 
 fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> {
@@ -152,7 +156,7 @@ fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> 
 
 /// Returns the raw value of a top-level-style `"key": "value"` string member.
 /// Values with escapes are rejected; timestamps and tokens never need them here.
-fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+pub(super) fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let mut rest = json;
     while let Some(index) = rest.find(&needle) {
@@ -167,7 +171,7 @@ fn json_string<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS[.fff]` followed by `Z`, `UTC` or `±HH:MM`.
-fn parse_timestamp(text: &str) -> Option<i64> {
+pub(super) fn parse_timestamp(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() < 20 || !text.is_ascii() {
         return None;

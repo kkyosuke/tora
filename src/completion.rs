@@ -1,16 +1,20 @@
 use std::{
     env,
     ffi::OsString,
-    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use clap::{CommandFactory, ValueEnum};
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Input, Select};
 
 use crate::cli::{Cli, CompletionCommand, ConfigKey, InstallShell};
+use crate::managed::{Change, apply, read, replace_block};
+
+fn block_range(text: &str) -> io::Result<Option<std::ops::Range<usize>>> {
+    crate::managed::block_range(text, BEGIN, END)
+}
 
 const BEGIN: &str = "# >>> tora completion >>>";
 const END: &str = "# <<< tora completion <<<";
@@ -215,47 +219,6 @@ fn quote(path: &Path) -> String {
     crate::shell::quote(path.to_str().expect("validated path"))
 }
 
-fn read(path: &Path) -> io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // A dangling symlink is not an absent file that we may replace.
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(io::Error::other(format!(
-                    "broken symlink: {}",
-                    path.display()
-                )));
-            }
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn block_range(text: &str) -> io::Result<Option<std::ops::Range<usize>>> {
-    let starts: Vec<_> = text.match_indices(BEGIN).collect();
-    let ends: Vec<_> = text.match_indices(END).collect();
-    match (starts.as_slice(), ends.as_slice()) {
-        ([], []) => Ok(None),
-        ([(start, _)], [(end, _)]) if start < end => {
-            let finish = end + END.len();
-            if (*start != 0 && !text[..*start].ends_with('\n'))
-                || (*end != 0 && !text[..*end].ends_with('\n'))
-                || !text[*start + BEGIN.len()..].starts_with('\n')
-                || (!text[finish..].is_empty() && !text[finish..].starts_with('\n'))
-            {
-                return Err(io::Error::other(
-                    "invalid tora completion markers; repair the startup file first",
-                ));
-            }
-            Ok(Some(*start..finish))
-        }
-        _ => Err(io::Error::other(
-            "duplicate or incomplete tora completion markers; repair the startup file first",
-        )),
-    }
-}
-
 fn unmanaged(text: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim();
@@ -275,33 +238,6 @@ fn loader(shell: InstallShell) -> String {
     format!(
         "{OWNER}# Shell: {name}\n# Generate completion from the current tora on each new shell.\nif [[ -z ${{_TORA_COMPLETION_{name}_LOADED-}} ]] && command -v tora >/dev/null 2>&1; then\n{init}    if _tora_completion_script=$(command tora completion {name}); then\n        eval \"$_tora_completion_script\"\n        _TORA_COMPLETION_{name}_LOADED=1\n    fi\n    unset _tora_completion_script\nfi\n"
     )
-}
-
-struct Change {
-    path: PathBuf,
-    before: Option<String>,
-    after: String,
-}
-
-impl Change {
-    fn new(path: PathBuf, after: String) -> io::Result<Self> {
-        let before = read(&path)?;
-        // Follow dotfile symlinks without replacing the link itself.
-        let path = if before.is_some() {
-            fs::canonicalize(path)?
-        } else {
-            path
-        };
-        Ok(Self {
-            path,
-            before,
-            after,
-        })
-    }
-
-    fn changed(&self) -> bool {
-        self.before.as_deref() != Some(&self.after)
-    }
 }
 
 fn startup_files(shell: InstallShell, home: &Path) -> io::Result<Vec<PathBuf>> {
@@ -438,24 +374,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
     let block = startup_block(shell, &destination);
     for file in files {
         let before = read(&file)?.unwrap_or_default();
-        let after = match block_range(&before)? {
-            Some(range) => format!(
-                "{}{}{}",
-                &before[..range.start],
-                block,
-                &before[range.end..]
-            ),
-            None => format!(
-                "{}{}{}\n",
-                before,
-                if before.is_empty() || before.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                },
-                block
-            ),
-        };
+        let after = replace_block(&before, block_range(&before)?, &block);
         changes.push(Change::new(file, after)?);
     }
     // Two startup paths may point to the same dotfile. Identical changes are
@@ -484,13 +403,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
     for change in &changes {
         eprintln!("  {}", change.path.display());
     }
-    if !yes
-        && !Confirm::new()
-            .with_prompt("Install completion?")
-            .default(false)
-            .interact()
-            .map_err(io::Error::other)?
-    {
+    if !crate::managed::confirm("Install completion?", yes)? {
         eprintln!("Cancelled; no files changed.");
         return Ok(());
     }
@@ -507,67 +420,6 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
         eprintln!(
             "The previous loader was retained; it is no longer referenced by the managed configuration."
         );
-    }
-    Ok(())
-}
-
-fn stage(change: &Change) -> io::Result<tempfile::NamedTempFile> {
-    let parent = change
-        .path
-        .parent()
-        .ok_or_else(|| io::Error::other("file has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    if change.before.is_some() {
-        temporary
-            .as_file()
-            .set_permissions(fs::metadata(&change.path)?.permissions())?;
-    }
-    temporary.write_all(change.after.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    Ok(temporary)
-}
-
-fn apply(changes: &[Change]) -> io::Result<()> {
-    // Prepare all writes first, so an unwritable destination does not leave a
-    // startup file pointing at a loader that could not be written.
-    let staged = changes.iter().map(stage).collect::<io::Result<Vec<_>>>()?;
-    for change in changes {
-        if read(&change.path)? != change.before {
-            return Err(io::Error::other(format!(
-                "{} changed during installation; retry",
-                change.path.display()
-            )));
-        }
-    }
-    for (index, (change, temporary)) in changes.iter().zip(staged).enumerate() {
-        if let Err(error) = temporary.persist(&change.path) {
-            let mut failures = Vec::new();
-            for previous in changes[..index].iter().rev() {
-                let restored = match &previous.before {
-                    Some(before) => stage(&Change {
-                        path: previous.path.clone(),
-                        before: Some(previous.after.clone()),
-                        after: before.clone(),
-                    })
-                    .and_then(|file| {
-                        file.persist(&previous.path)
-                            .map(|_| ())
-                            .map_err(|e| e.error)
-                    }),
-                    None => fs::remove_file(&previous.path),
-                };
-                if let Err(error) = restored {
-                    failures.push(format!("{}: {error}", previous.path.display()));
-                }
-            }
-            return Err(io::Error::other(format!(
-                "could not update {}: {}; rollback errors: {:?}",
-                change.path.display(),
-                error.error,
-                failures
-            )));
-        }
     }
     Ok(())
 }
@@ -675,19 +527,6 @@ mod tests {
             &["aws", "exec", "--login", "dev", "--"],
         ] {
             assert!(!at(words), "{words:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_damaged_or_duplicate_managed_blocks() {
-        for text in [
-            BEGIN.to_owned(),
-            END.to_owned(),
-            format!("{END}\n{BEGIN}"),
-            format!("{BEGIN}\n{END}\n{BEGIN}\n{END}"),
-            format!("echo '{BEGIN}\n{END}'"),
-        ] {
-            assert!(block_range(&text).is_err(), "{text}");
         }
     }
 }
