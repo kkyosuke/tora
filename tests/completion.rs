@@ -185,7 +185,10 @@ fn actual_shells_load_completions_and_quote_custom_paths() {
         .to_owned();
     for (shell, assertion) in [
         ("bash", "complete -p tora"),
-        ("zsh", "[[ ${_comps[tora]} == _tora ]] && functions _tora"),
+        (
+            "zsh",
+            "[[ ${_comps[tora]} == _tora_dynamic ]] && functions _tora",
+        ),
     ] {
         if Command::new(shell).arg("--version").output().is_err() {
             eprintln!("Skipping {shell}: not installed");
@@ -240,4 +243,108 @@ fn different_shells_cannot_overwrite_each_others_loader() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("different shell"));
     assert_eq!(fs::read(path).unwrap(), original);
     assert!(!f.path(".bashrc").exists());
+}
+
+fn fake_aws(f: &Fixture, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = f.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("aws"), format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(bin.join("aws"), fs::Permissions::from_mode(0o755)).unwrap();
+    let tora = PathBuf::from(env!("CARGO_BIN_EXE_tora"));
+    format!(
+        "{}:{}:/usr/bin:/bin",
+        bin.display(),
+        tora.parent().unwrap().display()
+    )
+}
+
+fn profile_request(path: &str, words: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_tora"))
+        .args(["__complete-aws-profiles", "--"])
+        .args(words)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn profile_request_lists_profiles_only_before_the_command_separator() {
+    let f = Fixture::new();
+    let path = fake_aws(
+        &f,
+        r#"[ "$*" = "configure list-profiles" ] && printf 'default\ndev admin\ndefault\n'"#,
+    );
+    for words in [
+        &["aws", "sso"][..],
+        &["aws", "exec"],
+        &["aws", "sso", "--select"],
+    ] {
+        let output = profile_request(&path, words);
+        success(&output);
+        assert_eq!(output.stdout, b"default\ndev admin\n", "{words:?}");
+    }
+    for words in [
+        &["aws", "exec", "--"][..],
+        &["aws", "exec", "default", "--"],
+        &["aws", "exec", "default", "--", "aws", "sso"],
+        &["aws", "sso", "default"],
+        &["aws", "profiles"],
+        &["aws"],
+        &[],
+    ] {
+        let output = profile_request(&path, words);
+        success(&output);
+        assert!(output.stdout.is_empty(), "{words:?}");
+    }
+}
+
+#[test]
+fn profile_request_is_silent_when_aws_cli_is_missing_or_fails() {
+    let f = Fixture::new();
+    let failing = fake_aws(&f, "printf 'partial\\n'; exit 3");
+    for path in [failing.as_str(), "/nonexistent"] {
+        let output = profile_request(path, &["aws", "sso"]);
+        success(&output);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn bash_completes_profiles_as_data_and_keeps_static_candidates() {
+    if Command::new("bash").arg("--version").output().is_err() {
+        eprintln!("Skipping bash: not installed");
+        return;
+    }
+    let f = Fixture::new();
+    // Names that would run or expand if the script treated them as shell code.
+    let path = fake_aws(&f, r#"printf 'default\ndev admin\n$(touch injected)\n*\n'"#);
+    let complete = |line: &str| {
+        let script = r#"eval "$(tora completion bash)" || exit 1
+read -r -a COMP_WORDS <<< "$LINE "
+[[ $LINE == *" " ]] && COMP_WORDS+=("")
+COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+$(complete -p tora | sed 's/.*-F \([^ ]*\).*/\1/') tora "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}"
+printf '%s\n' "${COMPREPLY[@]}""#;
+        let output = Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", script])
+            .env("LINE", line)
+            .env("PATH", &path)
+            .env_remove("BASH_ENV")
+            .current_dir(f.0.path())
+            .output()
+            .unwrap();
+        success(&output);
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        complete("tora aws sso "),
+        "default\ndev\\ admin\n\\$\\(touch\\ injected\\)\n\\*\n"
+    );
+    assert_eq!(complete("tora aws exec de"), "default\ndev\\ admin\n");
+    assert!(complete("tora aws sso --no-b").contains("--no-browser"));
+    assert!(complete("tora aws ").contains("profiles\nsso"));
+    assert!(!complete("tora aws exec default -- de").contains("default"));
+    assert!(!f.path("injected").exists());
 }

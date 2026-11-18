@@ -1,10 +1,12 @@
-use super::{history, profile_command, recent_marker};
+use super::{Settings, history};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::{
+    collections::HashMap,
     io::{self, BufRead, IsTerminal, Write},
     path::Path,
     process::Stdio,
 };
+use unicode_width::UnicodeWidthStr;
 
 const PLUGIN: &str = "session-manager-plugin";
 // DescribeInstances accepts at most 200 values per filter.
@@ -18,14 +20,38 @@ struct Instance {
     platform: String,
 }
 
+impl Instance {
+    fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            "-"
+        } else {
+            &self.name
+        }
+    }
+
+    /// Search covers what the user sees as data, not padding or history markers.
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        [&self.name, &self.id, &self.platform]
+            .iter()
+            .any(|field| field.to_lowercase().contains(&query))
+    }
+}
+
 pub(super) fn run(
     profile: Option<String>,
     target: Option<String>,
+    settings: &Settings,
     no_browser: bool,
     use_device_code: bool,
 ) -> io::Result<()> {
     if let Some(target) = &target {
         check_target(target)?;
+    }
+    if let Some(profile) = profile.as_deref().filter(|p| looks_like_instance_id(p)) {
+        return Err(io::Error::other(format!(
+            "{profile:?} looks like an instance ID, not a profile; use --target {profile}"
+        )));
     }
     // Fail before any login or selection when the session could never start.
     if !plugin_installed() {
@@ -34,14 +60,14 @@ pub(super) fn run(
              (https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)"
         )));
     }
-    let profile = super::resolve_profile(profile)?;
-    super::ensure_login(&profile, no_browser, use_device_code)?;
+    let profile = super::resolve_profile(profile, settings)?;
+    super::ensure_login(&profile, settings, no_browser, use_device_code)?;
     history::remember(&profile);
 
     let target = match target {
         Some(target) => target,
         None => {
-            let mut instances = list_instances(&profile)?;
+            let mut instances = list_instances(&profile, settings)?;
             if instances.is_empty() {
                 return Err(io::Error::other(format!(
                     "no Session Manager managed instances found for profile {profile:?}; \
@@ -49,21 +75,25 @@ pub(super) fn run(
                 )));
             }
             let recent = recent_targets(&profile);
-            let used = history::sort_by_recent(&mut instances, &recent, |i| &i.id);
-            let recent = &recent_ids(&instances[..used]);
-            let labels = labels(&instances, recent);
+            history::sort_by_recent(&mut instances, &recent, |i| &i.id);
+            let labels = labels(&instances, &recent);
             let index = if io::stdin().is_terminal() && io::stderr().is_terminal() {
-                select_terminal(&labels)?
+                select_terminal(&instances, &labels)?
             } else {
-                select_piped(&labels, &mut io::stdin().lock(), &mut io::stderr().lock())?
+                select_piped(
+                    &instances,
+                    &labels,
+                    &mut io::stdin().lock(),
+                    &mut io::stderr().lock(),
+                )?
             };
             instances.swap_remove(index).id
         }
     };
-    history::INSTANCES.remember(&format!("{profile}\t{target}"));
+    history::remember_instance(&profile, &target);
 
     eprintln!("Starting Session Manager session on {target} with profile {profile:?}...");
-    let mut command = profile_command(&profile);
+    let mut command = settings.profile_command(&profile);
     command.args(["ssm", "start-session", "--target", &target]);
     #[cfg(unix)]
     {
@@ -98,6 +128,15 @@ fn check_target(target: &str) -> io::Result<()> {
     }
 }
 
+/// EC2 (`i-`) and managed node (`mi-`) IDs: a prefix and 8 or 17 hex digits.
+fn looks_like_instance_id(value: &str) -> bool {
+    ["i-", "mi-"].iter().any(|prefix| {
+        value.strip_prefix(prefix).is_some_and(|hex| {
+            matches!(hex.len(), 8 | 17) && hex.chars().all(|c| c.is_ascii_hexdigit())
+        })
+    })
+}
+
 fn plugin_installed() -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(PLUGIN)))
@@ -117,7 +156,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Instance IDs used with this profile, most recent first.
+/// Targets used with this profile, most recent first.
 fn recent_targets(profile: &str) -> Vec<String> {
     history::INSTANCES
         .recent()
@@ -129,12 +168,9 @@ fn recent_targets(profile: &str) -> Vec<String> {
         .collect()
 }
 
-fn recent_ids(instances: &[Instance]) -> Vec<String> {
-    instances.iter().map(|i| i.id.clone()).collect()
-}
-
-fn text_query(profile: &str, args: &[&str]) -> io::Result<String> {
-    let output = profile_command(profile)
+fn text_query(profile: &str, settings: &Settings, args: &[&str]) -> io::Result<String> {
+    let output = settings
+        .profile_command(profile)
         .args(args)
         .args(["--output", "text"])
         .stderr(Stdio::piped())
@@ -151,9 +187,10 @@ fn text_query(profile: &str, args: &[&str]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn list_instances(profile: &str) -> io::Result<Vec<Instance>> {
+fn list_instances(profile: &str, settings: &Settings) -> io::Result<Vec<Instance>> {
     let output = text_query(
         profile,
+        settings,
         &[
             "ssm",
             "describe-instance-information",
@@ -167,11 +204,12 @@ fn list_instances(profile: &str) -> io::Result<Vec<Instance>> {
         .map(|i| i.id.as_str())
         .filter(|id| id.starts_with("i-"))
         .collect();
-    let mut names = Vec::new();
+    let mut names = HashMap::new();
     for chunk in ec2_ids.chunks(FILTER_CHUNK) {
         let filter = format!("Name=instance-id,Values={}", chunk.join(","));
         match text_query(
             profile,
+            settings,
             &[
                 "ec2",
                 "describe-instances",
@@ -184,14 +222,14 @@ fn list_instances(profile: &str) -> io::Result<Vec<Instance>> {
             Ok(output) => names.extend(parse_names(&output)),
             Err(error) => {
                 // Names are a convenience; Session Manager only needs the ID.
-                eprintln!("tora: could not read EC2 Name tags; showing IDs only\n{error}");
+                eprintln!("tora: could not read EC2 Name tags; showing host names\n{error}");
                 break;
             }
         }
     }
     for instance in &mut instances {
-        if let Some((_, name)) = names.iter().find(|(id, _)| *id == instance.id) {
-            instance.name = name.clone();
+        if let Some(name) = names.remove(&instance.id) {
+            instance.name = name;
         }
     }
     // Online instances first, then by name, so the list is stable between runs.
@@ -201,14 +239,31 @@ fn list_instances(profile: &str) -> io::Result<Vec<Instance>> {
     Ok(instances)
 }
 
-/// AWS CLI text output prints null as `None`; terminal control characters from tags are
-/// replaced so names cannot rewrite the menu.
+/// Characters that can reorder or hide text in a terminal: controls, bidirectional
+/// overrides/isolates, zero-width characters and other invisible format characters.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
+}
+
+/// AWS CLI text output prints null as `None`; unsafe characters from tags are replaced
+/// so names cannot rewrite or reorder the menu.
 fn field(value: Option<&str>) -> String {
     match value.map(str::trim) {
         None | Some("") | Some("None") => String::new(),
         Some(value) => value
             .chars()
-            .map(|c| if c.is_control() { '?' } else { c })
+            .map(|c| if is_unsafe_char(c) { '?' } else { c })
             .collect(),
     }
 }
@@ -234,7 +289,7 @@ fn parse_instances(output: &str) -> Vec<Instance> {
     instances
 }
 
-fn parse_names(output: &str) -> Vec<(String, String)> {
+fn parse_names(output: &str) -> HashMap<String, String> {
     output
         .lines()
         .filter_map(|line| {
@@ -245,54 +300,38 @@ fn parse_names(output: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Pads by terminal display width so full-width (e.g. Japanese) names stay aligned.
+fn pad(text: &str, width: usize) -> String {
+    format!("{text}{}", " ".repeat(width.saturating_sub(text.width())))
+}
+
 fn labels(instances: &[Instance], recent: &[String]) -> Vec<String> {
-    let width = |f: fn(&Instance) -> &str| {
-        instances
-            .iter()
-            .map(|i| f(i).chars().count())
-            .max()
-            .unwrap_or(0)
-    };
-    let (name_w, id_w, status_w) = (
-        width(|i| display_name(i)).max(1),
-        width(|i| &i.id),
-        width(|i| &i.status),
-    );
+    let width = |f: fn(&Instance) -> &str| instances.iter().map(|i| f(i).width()).max();
+    let name_w = width(Instance::display_name).unwrap_or(1);
+    let id_w = width(|i| &i.id).unwrap_or(0);
+    let status_w = width(|i| &i.status).unwrap_or(0);
     instances
         .iter()
         .map(|i| {
             let line = format!(
-                "{:<name_w$}  {:<id_w$}  {:<status_w$}  {}",
-                display_name(i),
-                i.id,
-                i.status,
+                "{}  {}  {}  {}",
+                pad(i.display_name(), name_w),
+                pad(&i.id, id_w),
+                pad(&i.status, status_w),
                 i.platform,
             );
-            format!(
-                "{}{}",
-                line.trim_end(),
-                recent_marker(recent.iter().position(|r| *r == i.id))
-            )
+            format!("{}{}", line.trim_end(), history::marker(&i.id, recent))
         })
         .collect()
 }
 
-fn display_name(instance: &Instance) -> &str {
-    if instance.name.is_empty() {
-        "-"
-    } else {
-        &instance.name
-    }
-}
-
-fn filtered(labels: &[String], query: &str) -> Vec<usize> {
-    let query = query.to_lowercase();
-    (0..labels.len())
-        .filter(|&i| labels[i].to_lowercase().contains(&query))
+fn filtered(instances: &[Instance], query: &str) -> Vec<usize> {
+    (0..instances.len())
+        .filter(|&i| instances[i].matches(query))
         .collect()
 }
 
-fn select_terminal(labels: &[String]) -> io::Result<usize> {
+fn select_terminal(instances: &[Instance], labels: &[String]) -> io::Result<usize> {
     let theme = ColorfulTheme::default();
     let mut visible: Vec<usize> = (0..labels.len()).collect();
     loop {
@@ -313,7 +352,8 @@ fn select_terminal(labels: &[String]) -> io::Result<usize> {
             .allow_empty(true)
             .interact_text()
             .map_err(io::Error::other)?;
-        let matches = filtered(labels, &query);
+        // Keep the current list on no match: an empty menu could only be cancelled.
+        let matches = filtered(instances, &query);
         if matches.is_empty() {
             eprintln!("No matching instances.");
         } else {
@@ -323,6 +363,7 @@ fn select_terminal(labels: &[String]) -> io::Result<usize> {
 }
 
 fn select_piped(
+    instances: &[Instance],
     labels: &[String],
     input: &mut impl BufRead,
     output: &mut impl Write,
@@ -349,7 +390,7 @@ fn select_piped(
             return Err(io::Error::other("instance selection cancelled"));
         }
         if let Some(query) = selection.strip_prefix('/') {
-            let matches = filtered(labels, query);
+            let matches = filtered(instances, query);
             if matches.is_empty() {
                 writeln!(output, "No matching instances.")?;
             } else {
@@ -388,42 +429,64 @@ mod tests {
         assert_eq!(instances[0].name, "ip-10-0-0-1");
         assert_eq!(instances[1].name, "");
         assert_eq!(instances[1].status, "ConnectionLost");
-        assert_eq!(
-            parse_names("i-0a\tweb\x1b[2J\ni-0b\tNone\n"),
-            vec![("i-0a".into(), "web?[2J".into())]
-        );
+        let names = parse_names("i-0a\tweb\x1b[2J\ni-0b\tNone\ni-0c\tdb\u{202E}1-i\u{200B}\n");
+        assert_eq!(names.len(), 2);
+        assert_eq!(names["i-0a"], "web?[2J");
+        assert_eq!(names["i-0c"], "db?1-i?");
     }
 
     #[test]
-    fn labels_align_columns_and_mark_history() {
+    fn labels_align_wide_names_and_mark_actual_last_used() {
         let instances = [
             instance("i-0aaa", "web", "Online"),
-            instance("i-0bbbbb", "", "Online"),
-            instance("i-0c", "batch-worker", "ConnectionLost"),
+            instance("i-0bbbbb", "本番DB", "Online"),
+            instance("i-0c", "", "ConnectionLost"),
         ];
-        let labels = labels(&instances, &["i-0aaa".into(), "i-0c".into()]);
+        // i-gone was used last but no longer exists: nothing is labelled last used.
+        let recent = ["i-gone".into(), "i-0aaa".into()];
+        let labels = labels(&instances, &recent);
         assert_eq!(
             labels[0],
-            "web           i-0aaa    Online          Amazon Linux  (last used)"
+            "web     i-0aaa    Online          Amazon Linux  (recent)"
         );
-        assert_eq!(
-            labels[1],
-            "-             i-0bbbbb  Online          Amazon Linux"
-        );
-        assert!(labels[2].ends_with("Amazon Linux  (recent)"));
+        assert_eq!(labels[1], "本番DB  i-0bbbbb  Online          Amazon Linux");
+        assert_eq!(labels[2], "-       i-0c      ConnectionLost  Amazon Linux");
+        let labels = super::labels(&instances, &["i-0c".into()]);
+        assert!(labels[2].ends_with("Amazon Linux  (last used)"));
+    }
+
+    #[test]
+    fn search_ignores_markers_and_padding() {
+        let instances = [
+            instance("i-1", "web", "Online"),
+            instance("i-2", "db", "Online"),
+        ];
+        assert_eq!(filtered(&instances, "DB"), [1]);
+        assert_eq!(filtered(&instances, "linux"), [0, 1]);
+        assert!(filtered(&instances, "recent").is_empty());
+        assert!(filtered(&instances, "Online").is_empty());
     }
 
     #[test]
     fn piped_menu_searches_retries_and_cancels() {
-        let labels = vec!["web i-1".to_owned(), "db i-2".to_owned()];
+        let instances = [
+            instance("i-1", "web", "Online"),
+            instance("i-2", "db", "Online"),
+        ];
+        let labels = labels(&instances, &[]);
         let mut output = Vec::new();
-        let index = select_piped(&labels, &mut &b"x\n9\n/DB\n/nothing\n1\n"[..], &mut output);
+        let index = select_piped(
+            &instances,
+            &labels,
+            &mut &b"x\n9\n/DB\n/nothing\n1\n"[..],
+            &mut output,
+        );
         assert_eq!(index.unwrap(), 1);
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Invalid selection"));
         assert!(output.contains("No matching instances"));
         for input in [&b"q\n"[..], &b""[..]] {
-            assert!(select_piped(&labels, &mut &input[..], &mut Vec::new()).is_err());
+            assert!(select_piped(&instances, &labels, &mut &input[..], &mut Vec::new()).is_err());
         }
     }
 
@@ -434,6 +497,16 @@ mod tests {
         }
         for target in ["", "-i", "--profile", "i 1", "i-1\n", "i-1;rm"] {
             assert!(!valid_target(target), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn detects_instance_ids_passed_as_profiles() {
+        for value in ["i-0123456789abcdef0", "i-0123abcd", "mi-0123456789abcdef0"] {
+            assert!(looks_like_instance_id(value), "{value}");
+        }
+        for value in ["dev", "i-dev", "prod-i-0123abcd", "i-0123"] {
+            assert!(!looks_like_instance_id(value), "{value}");
         }
     }
 }
