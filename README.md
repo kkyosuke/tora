@@ -30,6 +30,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | --- | --- | --- |
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
+| 今のシェルの接続先を切り替える | `tora-use dev` | 必要なら SSO ログインし、今のシェルの `AWS_PROFILE` を切り替え（要 `tora completion install`） |
 | 今の認証状態を確認する | `tora aws status` | `whoami` の内容に SSO 期限の残り時間を加えて表示 |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
 | 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
@@ -237,6 +238,8 @@ Zsh / Bash では、プロファイルを指定する位置で Tab を押すと
 エラーを表示せず、プロファイル名の候補を出さないだけです。Tab のたびに AWS CLI を呼ぶため、
 候補の表示までに少し時間がかかることがあります。
 設定済みの場合も `tora completion install` の再実行は不要で、tora の更新後に新しいシェルを開けば有効になります。
+ただし読み込み設定（保存先のファイル）自体が変わる更新、たとえば
+[`tora-use`](#今のシェルのプロファイルを切り替える) の追加では再実行が必要です。`tora doctor` が知らせます。
 fish / powershell / elvish はプロファイル名の補完に対応していません。
 
 再実行時は保存済みのパスを使い、同じ内容なら何も変更しません。
@@ -371,11 +374,31 @@ tora aws sso dev --no-shell                         # 認証確認・必要な�
 tora aws sso dev --no-browser --use-device-code      # 別デバイスのブラウザーで認証
 ```
 
-<details>
-<summary>現在の Bash / Zsh に認証環境を反映する</summary>
+### 今のシェルのプロファイルを切り替える
 
-現在の Bash / Zsh 自体に反映する場合は、認証成功時のみ出力するシェル文を評価できます。
-認証メッセージ・選択メニューは標準エラーに出力します。
+`tora completion install` で設定した Bash / Zsh では、シェル関数 `tora-use` が使えます。
+子プロセスである `tora` は親シェルの環境を変えられないため、`tora aws sso --export` の
+出力をシェル関数が評価して、今のシェルの `AWS_PROFILE` を切り替えます。
+
+```sh
+tora-use dev                    # 必要な場合だけ SSO ログインし、AWS_PROFILE=dev に切り替え
+tora-use                        # プロファイルを検索・選択（AWS_PROFILE や保存値があっても選択）
+tora-use --no-browser dev       # --no-browser / --use-device-code も指定可能
+```
+
+- ログインの失敗・選択のキャンセル時は環境を変えず、0 以外で終了します。
+  `set -e` / `set -u` を有効にしたシェルでも使えます。
+- 成功時は `tora aws sso --export` と同じく、アクセスキー環境変数を解除して `AWS_PROFILE`
+  （リージョンを設定済みなら `AWS_REGION` / `AWS_DEFAULT_REGION`）を設定します。
+- プロファイル名は Tab で補完できます。
+- 同名のエイリアス・コマンドがあれば定義しません。`sh`（POSIX モードの Bash）でも定義しません。
+- 既存の補完設定は、`tora completion install` を再実行すると `tora-use` を含む内容に更新されます。
+  更新が必要な場合は `tora doctor` が知らせます。
+
+<details>
+<summary>シェル関数を使わずに現在の Bash / Zsh へ反映する</summary>
+
+認証成功時のみ出力するシェル文を評価できます。認証メッセージ・選択メニューは標準エラーに出力します。
 
 ```sh
 if tora_aws_env=$(tora aws sso dev --export); then
