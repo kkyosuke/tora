@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     process::{Command, Output},
 };
@@ -246,7 +246,6 @@ fn different_shells_cannot_overwrite_each_others_loader() {
 }
 
 fn fake_aws(f: &Fixture, body: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let bin = f.path("bin");
     fs::create_dir_all(&bin).unwrap();
     fs::write(bin.join("aws"), format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -347,4 +346,237 @@ printf '%s\n' "${COMPREPLY[@]}""#;
     assert!(complete("tora aws ").contains("profiles\nsso"));
     assert!(!complete("tora aws exec default -- de").contains("default"));
     assert!(!f.path("injected").exists());
+}
+
+const SWITCH_AWS: &str = r#"printf '%s\n' "$*" >> "$HOME/calls"
+case "$*" in
+  *'sts get-caller-identity'*)
+    [ -z "$TEST_EXPIRED" ] && exit 0
+    printf '%s\n' 'Error loading SSO Token: Token for dev does not exist' >&2; exit 1;;
+  *'sso login'*) printf 'login output\n'; exit "${TEST_LOGIN_STATUS:-0}";;
+  *'configure list-profiles'*) printf 'default\ndev\ndev admin\n';;
+  *) exit 1;;
+esac"#;
+
+/// Run `script` in a non-interactive `shell` that sourced the installed loader
+/// with `set -eu`, as a strict user configuration would.
+fn use_shell(f: &Fixture, shell: &str, path: &str, script: &str) -> Option<Output> {
+    // Look the shell up on the same PATH it will run with.
+    if Command::new(shell)
+        .arg("--version")
+        .env("PATH", path)
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping {shell}: not installed");
+        return None;
+    }
+    let loader = f.path(&format!(".tora/completions/{shell}"));
+    if !loader.exists() {
+        success(&f.install(shell));
+    }
+    let output = Command::new(shell)
+        .args(if shell == "bash" {
+            &["--noprofile", "--norc", "-c"][..]
+        } else {
+            &["-f", "-c"]
+        })
+        .arg(format!("set -eu\n. \"$LOADER\"\n{script}"))
+        .env("LOADER", loader)
+        .env("HOME", f.0.path())
+        .env("ZDOTDIR", f.0.path())
+        .env("PATH", path)
+        .env_remove("TORA_HOME")
+        .env_remove("BASH_ENV")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_DEFAULT_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .current_dir(f.0.path())
+        .output()
+        .unwrap();
+    Some(output)
+}
+
+fn stdout(output: &Output) -> String {
+    success(output);
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+#[test]
+fn tora_use_switches_the_current_shell_only_after_successful_login() {
+    for shell in ["bash", "zsh"] {
+        let f = Fixture::new();
+        let path = fake_aws(&f, SWITCH_AWS);
+        let Some(output) = use_shell(
+            &f,
+            shell,
+            &path,
+            r#"export AWS_PROFILE=old AWS_ACCESS_KEY_ID=key AWS_REGION=eu-west-1
+tora-use 'dev admin'
+printf 'profile=%s key=%s region=%s\n' "$AWS_PROFILE" "${AWS_ACCESS_KEY_ID-unset}" "$AWS_DEFAULT_REGION"
+export AWS_PROFILE=old AWS_ACCESS_KEY_ID=key
+TEST_EXPIRED=1 tora-use dev
+printf 'profile=%s key=%s\n' "$AWS_PROFILE" "${AWS_ACCESS_KEY_ID-unset}""#,
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            stdout(&output),
+            "profile=dev admin key=unset region=eu-west-1\nprofile=dev key=unset\n",
+            "{shell}"
+        );
+        let calls = fs::read_to_string(f.path("calls")).unwrap();
+        assert!(
+            calls.contains("sso login --profile dev"),
+            "{shell}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn tora_use_failure_or_cancellation_leaves_the_environment_unchanged() {
+    for shell in ["bash", "zsh"] {
+        let f = Fixture::new();
+        let path = fake_aws(&f, SWITCH_AWS);
+        // Each attempt must fail without aborting the `set -e` shell.
+        let Some(output) = use_shell(
+            &f,
+            shell,
+            &path,
+            r#"export AWS_PROFILE=old AWS_ACCESS_KEY_ID=key
+if TEST_EXPIRED=1 TEST_LOGIN_STATUS=4 tora-use dev; then echo changed; else echo "login=$?"; fi
+if tora-use <<< q; then echo changed; else echo "cancel=$?"; fi
+if tora-use --select dev; then echo changed; else echo "usage=$?"; fi
+if PATH=/nonexistent tora-use dev; then echo changed; else echo "missing=$?"; fi
+tora-use --help | head -n 1
+printf 'profile=%s key=%s\n' "$AWS_PROFILE" "$AWS_ACCESS_KEY_ID""#,
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            stdout(&output),
+            "login=1\ncancel=1\nusage=2\nmissing=127\n\
+             Usage: tora-use [--select] [--no-browser] [--use-device-code] [PROFILE]\n\
+             profile=old key=key\n",
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn tora_use_without_a_profile_selects_one_instead_of_reusing_the_environment() {
+    for shell in ["bash", "zsh"] {
+        let f = Fixture::new();
+        let path = fake_aws(&f, SWITCH_AWS);
+        let Some(output) = use_shell(
+            &f,
+            shell,
+            &path,
+            r#"export AWS_PROFILE=default
+tora-use --no-browser <<< 2
+printf 'profile=%s\n' "$AWS_PROFILE"
+tora-use -- '-odd' >/dev/null 2>&1
+printf 'profile=%s\n' "$AWS_PROFILE""#,
+        ) else {
+            continue;
+        };
+        assert_eq!(stdout(&output), "profile=dev\nprofile=-odd\n", "{shell}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Select AWS profile"));
+    }
+}
+
+#[test]
+fn tora_use_completes_profiles_and_options() {
+    let f = Fixture::new();
+    let path = fake_aws(&f, SWITCH_AWS);
+    let Some(output) = use_shell(
+        &f,
+        "bash",
+        &path,
+        r#"complete -p tora-use
+reply() { COMP_WORDS=("$@"); COMP_CWORD=$(($# - 1)); _tora_use_complete; printf '[%s]' ${COMPREPLY[@]+"${COMPREPLY[@]}"}; echo; }
+reply tora-use de
+reply tora-use --no-browser ''
+reply tora-use dev ''
+reply tora-use --no
+reply tora-use --select ''"#,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        stdout(&output),
+        "complete -F _tora_use_complete tora-use\n\
+         [default][dev][dev\\ admin]\n[default][dev][dev\\ admin]\n[]\n[--no-browser]\n[]\n"
+    );
+    if let Some(output) = use_shell(&f, "zsh", &path, "print -r -- ${_comps[tora-use]}") {
+        assert_eq!(stdout(&output), "_tora_use\n");
+    }
+}
+
+#[test]
+fn tora_use_leaves_existing_names_and_posix_shells_alone() {
+    let f = Fixture::new();
+    let path = fake_aws(&f, SWITCH_AWS);
+    let other = f.path("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("tora-use"), "#!/bin/sh\necho external\n").unwrap();
+    fs::set_permissions(other.join("tora-use"), fs::Permissions::from_mode(0o755)).unwrap();
+    let with_command = format!("{}:{path}", other.display());
+    for shell in ["bash", "zsh"] {
+        let alias = if shell == "bash" {
+            "shopt -s expand_aliases; alias tora-use='echo alias'"
+        } else {
+            "alias tora-use='echo alias'"
+        };
+        // The alias is defined before the loader, as in a user's startup file.
+        let Some(output) = use_shell(&f, shell, &path, "true") else {
+            continue;
+        };
+        success(&output);
+        let loader = f.path(&format!(".tora/completions/{shell}"));
+        let check = Command::new(shell)
+            .arg(if shell == "bash" { "--norc" } else { "-f" })
+            .arg("-c")
+            .arg(format!(
+                "{alias}\n. \"$LOADER\"\neval 'tora-use'\n{}",
+                if shell == "bash" {
+                    "type -t _tora_use_complete || echo none"
+                } else {
+                    "(( $+functions[_tora_use] )) && echo defined || echo none"
+                }
+            ))
+            .env("LOADER", &loader)
+            .env("HOME", f.0.path())
+            .env("ZDOTDIR", f.0.path())
+            .env("PATH", &path)
+            .env_remove("TORA_HOME")
+            .env_remove("BASH_ENV")
+            .output()
+            .unwrap();
+        assert_eq!(stdout(&check), "alias\nnone\n", "{shell}");
+        let Some(output) = use_shell(&f, shell, &with_command, "tora-use") else {
+            continue;
+        };
+        assert_eq!(stdout(&output), "external\n", "{shell}");
+    }
+    // sh is Bash in POSIX mode on some systems and may read the login file.
+    let output = Command::new("bash")
+        .args([
+            "--posix",
+            "-c",
+            "set -eu; . \"$LOADER\"; type -t tora-use || echo none",
+        ])
+        .env("LOADER", f.path(".tora/completions/bash"))
+        .env("HOME", f.0.path())
+        .env("PATH", &path)
+        .env_remove("BASH_ENV")
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&output), "none\n");
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
