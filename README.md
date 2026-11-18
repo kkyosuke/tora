@@ -31,6 +31,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | AWS の接続先を確認する | `tora aws profiles` | 設定済みプロファイルを一覧表示 |
 | 接続先を選んでログインする | `tora aws sso` | 対話選択 → SSO ログイン → 認証用シェル |
 | 今の認証状態を確認する | `tora aws status` | `whoami` の内容に SSO 期限の残り時間を加えて表示 |
+| プロンプトに接続先を表示する | `tora aws prompt` | プロファイルと SSO の残り時間を高速に出力（例: `dev (52m)`） |
 | AWS の接続先を指定して実行する | `tora aws exec dev -- terraform plan` | 選択したプロファイルの環境でコマンドを実行 |
 | 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
 | EC2 にログインする | `tora aws ssm` | インスタンスを選んで Session Manager で接続（前回の接続先を表示） |
@@ -360,6 +361,90 @@ SSO トークンの期限後も、取得済みのロール認証情報が有効�
 
 </details>
 
+### シェルプロンプトに表示する
+
+`tora aws prompt` は、現在のプロファイルと SSO の残り時間をプロンプト用に短く出力します。
+
+```sh
+tora aws prompt                                  # dev (52m)
+tora aws prompt --format '{profile}:{remaining}' # dev:52m
+```
+
+| 状態 | 出力 |
+| --- | --- |
+| SSO トークンが有効 | `dev (52m)` / `dev (3h 12m)` / `dev (<1m)` |
+| 期限切れ | `dev (expired)` |
+| アクセストークンは期限切れだが更新用トークンがある（SSO セッション中なら次の `aws` 実行で自動更新） | `dev (refresh)` |
+| SSO を使わない・期限を判定できない | `dev` |
+| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` が未設定（空を含む） | 何も出力しない |
+
+プロンプトは毎回実行されるため、AWS CLI もネットワークも使わず、AWS の設定ファイル
+（`AWS_CONFIG_FILE` または `~/.aws/config`）と SSO キャッシュを直接読みます（目安 2ms）。
+選択メニューは出さず、標準エラーにも出力せず、常に終了コード 0 で終了します。
+表示するのはシェルの `aws` コマンドが使う環境変数のプロファイルで、`aws.profile` の保存値は使いません。
+`--format` では `{profile}` と `{remaining}`（判定できなければ空）を置き換えます。
+
+残り時間は `tora aws status` と同じく現在のアクセストークンの期限です。`sso-session` を使う設定では
+約 1 時間ごとに `refresh` になりますが、SSO セッションが続く間は AWS CLI が自動更新します。
+SSO セッション自体の終了時刻はキャッシュに残らないため、`refresh` のままコマンドが失敗する場合は
+`tora aws sso` でログインしてください。設定ファイルのパスは `~` だけを展開します（`$HOME` などは展開しません）。
+
+<details>
+<summary>starship / zsh / bash の設定例（本番プロファイルを赤で表示）</summary>
+
+例では名前に `prod` を含むプロファイルを本番として赤で表示します。条件は環境に合わせて変えてください。
+
+starship（`~/.config/starship.toml`）: 組み込みの `[aws]` と重複する場合は `[aws] disabled = true` にします。
+
+```toml
+[custom.tora_aws]
+command = "tora aws prompt"
+when = 'case "${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}" in ""|*prod*) false ;; esac'
+shell = ["sh"]
+format = "[☁ $output]($style) "
+style = "bold yellow"
+
+[custom.tora_aws_prod]
+command = "tora aws prompt"
+when = 'case "${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}" in *prod*) true ;; *) false ;; esac'
+shell = ["sh"]
+format = "[☁ $output]($style) "
+style = "bold red"
+```
+
+zsh（`~/.zshrc`）:
+
+```zsh
+setopt PROMPT_SUBST
+tora_aws_prompt() {
+  local out=$(tora aws prompt)
+  [[ -n $out ]] || return 0
+  out=${out//\%/%%}  # プロファイル名の % をプロンプトの書式として解釈させない
+  case ${AWS_PROFILE:-$AWS_DEFAULT_PROFILE} in
+    *prod*) print -rn -- "%F{red}[$out]%f " ;;
+    *) print -rn -- "%F{yellow}[$out]%f " ;;
+  esac
+}
+PROMPT='$(tora_aws_prompt)'$PROMPT
+```
+
+bash（`~/.bashrc`）:
+
+```bash
+tora_aws_prompt() {
+  local out
+  out=$(tora aws prompt)
+  [ -n "$out" ] || return 0
+  case ${AWS_PROFILE:-$AWS_DEFAULT_PROFILE} in
+    *prod*) printf '\001\033[31m\002[%s]\001\033[0m\002 ' "$out" ;;
+    *) printf '[%s] ' "$out" ;;
+  esac
+}
+PS1='$(tora_aws_prompt)'$PS1
+```
+
+</details>
+
 ### ログイン方法を選ぶ
 
 ```sh
@@ -508,6 +593,7 @@ bash scripts/check.sh              # CI・リリースと共通の検証
 - `src/aws.rs`: AWS CLI の呼び出し、プロファイル選択、認証用シェル。
 - `src/aws/settings.rs`: 1操作ごとの設定の読み込み、認証環境と export の生成。
 - `src/aws/status.rs`: `whoami` の表示に SSO 期限を加える `aws status`。
+- `src/aws/prompt.rs`: AWS CLI を呼ばずに設定ファイルと SSO キャッシュを読む `aws prompt`。
 - `tests/aws.rs`: AWS CLI・シェルを模擬する Rust 結合テスト。
 - `src/config.rs` / `src/doctor.rs`: 既定値の保存と環境診断。
 - `tests/helpers.rs`: 設定・接続先確認・ログアウト・診断・更新確認の結合テスト。

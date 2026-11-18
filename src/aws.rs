@@ -1,4 +1,5 @@
 mod history;
+mod prompt;
 mod settings;
 mod ssm;
 mod status;
@@ -14,6 +15,11 @@ use std::{
 };
 
 pub fn run(command: AwsCommands) -> io::Result<()> {
+    // Runs on every shell prompt: never load (or fail on) tora's config first.
+    if let AwsCommands::Prompt { format } = &command {
+        prompt::run(format.as_deref());
+        return Ok(());
+    }
     let settings = Settings::load()?;
     match command {
         AwsCommands::Whoami { profile } => {
@@ -67,6 +73,7 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
             }
             Ok(())
         }
+        AwsCommands::Prompt { .. } => unreachable!("handled before loading settings"),
         AwsCommands::Sso {
             profile,
             select,

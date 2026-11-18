@@ -2,7 +2,7 @@ use super::Settings;
 use std::{
     fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -68,17 +68,18 @@ fn login_hint(profile: &str) -> String {
     format!("run `tora aws sso{argument}` to log in")
 }
 
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-struct Expiry {
+pub(super) struct Expiry {
     /// Validated timestamp text from the cache file (digits and separators only).
     text: String,
-    epoch: i64,
-    refreshable: bool,
+    pub(super) epoch: i64,
+    /// AWS CLI renews the access token with this while the SSO session lasts.
+    pub(super) refreshable: bool,
 }
 
 fn describe_expiry(expiry: Option<&Expiry>, now: i64) -> String {
@@ -97,7 +98,7 @@ fn describe_expiry(expiry: Option<&Expiry>, now: i64) -> String {
     format!("{} ({} remaining{note})", expiry.text, duration(remaining))
 }
 
-fn duration(seconds: i64) -> String {
+pub(super) fn duration(seconds: i64) -> String {
     let minutes = seconds / 60;
     match (minutes / 60, minutes % 60) {
         (0, 0) => "less than 1m".into(),
@@ -113,19 +114,16 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
     // start URL for legacy profiles without an sso-session.
     let key = configured(profile, settings, "sso_session")
         .or_else(|| configured(profile, settings, "sso_start_url"))?;
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    let path = PathBuf::from(home)
+    cached_expiry(&key)
+}
+
+/// Reads the token cache for an sso-session name or legacy start URL.
+/// Any failure means "unknown". Never starts AWS CLI.
+pub(super) fn cached_expiry(key: &str) -> Option<Expiry> {
+    let path = home()?
         .join(".aws/sso/cache")
         .join(format!("{}.json", sha1_hex(key.as_bytes())));
-    let mut content = String::new();
-    fs::File::open(path)
-        .ok()?
-        .take(MAX_BYTES + 1)
-        .read_to_string(&mut content)
-        .ok()?;
-    if content.len() as u64 > MAX_BYTES {
-        return None;
-    }
+    let content = read_small(&path, MAX_BYTES)?;
     // The file also holds the access token; extract the timestamp only and
     // never print or log anything else from it.
     let text = json_string(&content, "expiresAt")?;
@@ -134,6 +132,28 @@ fn sso_expiry(profile: &str, settings: &Settings) -> Option<Expiry> {
         text: text.to_owned(),
         refreshable: json_string(&content, "refreshToken").is_some(),
     })
+}
+
+pub(super) fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The whole file as text, or None when it is not a readable regular file of
+/// at most `max` bytes.
+pub(super) fn read_small(path: &Path, max: u64) -> Option<String> {
+    // Opening a FIFO or device could block; only regular files are read.
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut content = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(max + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    (content.len() as u64 <= max).then_some(content)
 }
 
 fn configured(profile: &str, settings: &Settings, name: &str) -> Option<String> {
