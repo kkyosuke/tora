@@ -29,7 +29,7 @@ pub fn read(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// The byte range of the managed block from `begin` through `end`, if present.
-/// Markers must occupy whole lines and appear exactly once each.
+/// Markers must occupy whole lines (LF or CRLF) and appear exactly once each.
 pub fn block_range(text: &str, begin: &str, end: &str) -> io::Result<Option<Range<usize>>> {
     let starts: Vec<_> = text.match_indices(begin).collect();
     let ends: Vec<_> = text.match_indices(end).collect();
@@ -39,8 +39,8 @@ pub fn block_range(text: &str, begin: &str, end: &str) -> io::Result<Option<Rang
             let finish = stop + end.len();
             if (*start != 0 && !text[..*start].ends_with('\n'))
                 || !text[..*stop].ends_with('\n')
-                || !text[*start + begin.len()..].starts_with('\n')
-                || (!text[finish..].is_empty() && !text[finish..].starts_with('\n'))
+                || !line_break(&text[*start + begin.len()..])
+                || (!text[finish..].is_empty() && !line_break(&text[finish..]))
             {
                 return Err(io::Error::other(format!(
                     "invalid tora markers ({begin}); repair the file first"
@@ -54,17 +54,29 @@ pub fn block_range(text: &str, begin: &str, end: &str) -> io::Result<Option<Rang
     }
 }
 
-/// Replaces the managed block, or appends it (newline-terminated) when absent.
-pub fn replace_block(text: &str, range: Option<Range<usize>>, block: &str) -> String {
+fn line_break(text: &str) -> bool {
+    text.starts_with('\n') || text.starts_with("\r\n")
+}
+
+/// The file's line ending: CRLF when its first line ends with CRLF, else LF.
+pub fn line_ending(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(index) if text[..index].ends_with('\r') => "\r\n",
+        _ => "\n",
+    }
+}
+
+/// Replaces the managed block, or appends it terminated by `eol` when absent.
+pub fn replace_block(text: &str, range: Option<Range<usize>>, block: &str, eol: &str) -> String {
     match range {
         Some(range) => format!("{}{block}{}", &text[..range.start], &text[range.end..]),
         None => {
             let separator = if text.is_empty() || text.ends_with('\n') {
                 ""
             } else {
-                "\n"
+                eol
             };
-            format!("{text}{separator}{block}\n")
+            format!("{text}{separator}{block}{eol}")
         }
     }
 }
@@ -264,11 +276,29 @@ mod tests {
         let text = format!("a\n{BEGIN}\nold\n{END}\nb\n");
         let range = block_range(&text, BEGIN, END).unwrap();
         assert_eq!(
-            replace_block(&text, range, &block),
+            replace_block(&text, range, &block, "\n"),
             format!("a\n{block}\nb\n")
         );
-        assert_eq!(replace_block("a", None, &block), format!("a\n{block}\n"));
-        assert_eq!(replace_block("", None, &block), format!("{block}\n"));
+        assert_eq!(
+            replace_block("a", None, &block, "\n"),
+            format!("a\n{block}\n")
+        );
+        assert_eq!(replace_block("", None, &block, "\n"), format!("{block}\n"));
+        assert_eq!(
+            replace_block("a\r\nb", None, &block, "\r\n"),
+            format!("a\r\nb\r\n{block}\r\n")
+        );
+    }
+
+    #[test]
+    fn accepts_crlf_markers_and_detects_line_endings() {
+        let text = format!("a\r\n{BEGIN}\r\nold\r\n{END}\r\nb\r\n");
+        let range = block_range(&text, BEGIN, END).unwrap().unwrap();
+        assert_eq!(&text[range], format!("{BEGIN}\r\nold\r\n{END}"));
+        assert_eq!(line_ending(&text), "\r\n");
+        assert_eq!(line_ending("a\nb\r\n"), "\n");
+        assert_eq!(line_ending("a"), "\n");
+        assert!(block_range(&format!("{BEGIN}\rx\n{END}"), BEGIN, END).is_err());
     }
 
     #[test]

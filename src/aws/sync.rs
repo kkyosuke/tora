@@ -120,7 +120,11 @@ pub(super) fn run(options: Options, settings: &Settings) -> io::Result<()> {
         );
         return Ok(());
     }
-    let after = managed::replace_block(&text, range, &block);
+    // Write the block with the file's own line endings (CRLF or LF) and keep
+    // every byte outside it unchanged.
+    let eol = managed::line_ending(&text);
+    let block = block.replace('\n', eol);
+    let after = managed::replace_block(&text, range, &block, eol);
     let change = Change::with_before(path, before, after)?;
     if !change.changed() {
         eprintln!(
@@ -131,7 +135,13 @@ pub(super) fn run(options: Options, settings: &Settings) -> io::Result<()> {
         return Ok(());
     }
     eprintln!("File to update: {}", change.path.display());
-    eprint!("{}", managed::diff(old_block, &block, 2));
+    let diff = managed::diff(old_block, &block, 2);
+    if diff.lines().any(|line| line.starts_with(['+', '-'])) {
+        eprint!("{diff}");
+    } else {
+        let name = if eol == "\r\n" { "CRLF" } else { "LF" };
+        eprintln!("  (only line endings change: the managed block is rewritten with {name})");
+    }
     eprintln!(
         "{} profiles for sso-session {:?}; only the managed block changes.",
         profiles.len(),

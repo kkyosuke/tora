@@ -374,7 +374,7 @@ fn install(shell: Option<InstallShell>, path: Option<PathBuf>, yes: bool) -> io:
     let block = startup_block(shell, &destination);
     for file in files {
         let before = read(&file)?.unwrap_or_default();
-        let after = replace_block(&before, block_range(&before)?, &block);
+        let after = replace_block(&before, block_range(&before)?, &block, "\n");
         changes.push(Change::new(file, after)?);
     }
     // Two startup paths may point to the same dotfile. Identical changes are

@@ -1640,3 +1640,45 @@ fn sync_failures_leave_the_config_unchanged_and_log_in_at_most_once() {
         0o700
     );
 }
+
+#[test]
+fn sync_keeps_crlf_files_in_crlf() {
+    let f = sync_fixture();
+    let crlf = SYNC_CONFIG.replace('\n', "\r\n");
+    fs::write(f.0.join("config"), &crlf).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("+ [profile Prod-ReadOnly]"), "{stderr}");
+    let written = config(&f);
+    // Everything outside the block is byte-for-byte unchanged and the block uses CRLF.
+    assert!(written.starts_with(&crlf));
+    assert!(written[crlf.len()..].starts_with("# >>> tora aws sync abc >>>\r\n"));
+    assert!(written.ends_with("# <<< tora aws sync abc <<<\r\n"));
+    assert!(!written.replace("\r\n", "").contains('\n'));
+    let output = sync(&f, &["--yes"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already up to date"));
+
+    // A file converted to CRLF after the first sync is still recognized.
+    let f = sync_fixture();
+    assert!(sync(&f, &["--yes"]).status.success());
+    let converted = config(&f).replace('\n', "\r\n");
+    fs::write(f.0.join("config"), &converted).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("already up to date"), "{stderr}");
+    assert_eq!(config(&f), converted);
+
+    // Converting back to LF inside a CRLF file rewrites only the block's line endings.
+    let mixed = converted.replacen(
+        "# >>> tora aws sync abc >>>\r\n",
+        "# >>> tora aws sync abc >>>\n",
+        1,
+    );
+    fs::write(f.0.join("config"), &mixed).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only line endings change"), "{stderr}");
+    assert_eq!(config(&f), converted);
+}
