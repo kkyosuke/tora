@@ -1155,13 +1155,20 @@ fn prompt_reads_legacy_profiles_from_aws_config_file() {
 }
 
 #[test]
-fn prompt_is_silent_without_an_environment_profile() {
+fn prompt_resolves_profile_like_status_but_is_silent_without_one() {
     let f = Fixture::new();
-    // A broken tora config and saved default neither fail nor select a profile.
-    fs::create_dir_all(f.0.join("tora")).unwrap();
-    fs::write(f.0.join("tora/config"), "aws.profile=saved\nbroken\n").unwrap();
     assert_eq!(prompt(&f, &[], &[]), "");
     assert_eq!(prompt(&f, &[], &[("AWS_PROFILE", "")]), "");
+    fs::create_dir_all(f.0.join("tora")).unwrap();
+    fs::write(f.0.join("tora/config"), "aws.profile=saved\n").unwrap();
+    assert_eq!(prompt(&f, &[], &[]), "saved\n");
+    assert_eq!(
+        prompt(&f, &[], &[("AWS_DEFAULT_PROFILE", "fallback")]),
+        "fallback\n"
+    );
+    // A broken tora config neither fails nor prints anything.
+    fs::write(f.0.join("tora/config"), "aws.profile=saved\nbroken\n").unwrap();
+    assert_eq!(prompt(&f, &[], &[]), "");
     assert_eq!(prompt(&f, &[], &[("AWS_PROFILE", "bad\u{1b}[31m")]), "");
     assert_eq!(
         prompt(
