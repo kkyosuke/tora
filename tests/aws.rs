@@ -67,6 +67,30 @@ if [ "$1" = sts ]; then
   printf '%s\n' "${CHECK_ERROR-Error when retrieving token from sso: Token has expired and refresh failed}" >&2
   exit "${CHECK_STATUS:-1}"
 fi
+if [ "$1" = sso ] && { [ "$2" = list-accounts ] || [ "$2" = list-account-roles ]; }; then
+  input=
+  while [ $# -gt 0 ]; do
+    case "$1" in --cli-input-json) IFS= read -r input < "${2#file://}"; shift ;; esac
+    shift
+  done
+  printf '%s\n' "$input" >> "$HOME/sso-input"
+  case "$input" in
+    *'"accessToken": "'"${SSO_TOKEN:-cached-token}"'"'*) ;;
+    *) printf 'An error occurred (UnauthorizedException) when calling the ListAccounts operation: Session token not found or invalid\n' >&2; exit 254 ;;
+  esac
+  case "$input" in
+    *accountId*)
+      id=${input#*'"accountId": "'}; id=${id%%'"'*}
+      printf '%s\n' "$SSO_ROLES" | while IFS= read -r line; do
+        case "$line" in "$id	"*) printf '%s\n' "${line#*	}" ;; esac
+      done ;;
+    *) printf '%s' "$SSO_ACCOUNTS" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = sso ] && [ "$2" = login ] && [ -n "$LOGIN_CACHE" ] && [ "${LOGIN_STATUS:-0}" = 0 ]; then
+  printf '%s' "$LOGIN_CACHE_CONTENT" > "$LOGIN_CACHE"
+fi
 printf 'login output: $(touch injected)\n'
 printf 'login profile: %s\n' "$AWS_PROFILE" >&2
 exit "${LOGIN_STATUS:-0}"
@@ -1633,4 +1657,337 @@ fn ssm_accepts_instance_like_profile_from_environment() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("session:i-0123abcd:i-0aaa:"));
+}
+
+const SYNC_CONFIG: &str = "# my settings\n[sso-session abc]\nsso_start_url = https://example.awsapps.com/start\nsso_region = us-east-1\n\n[profile Prod-Admin]\nregion = eu-west-1\n";
+const SYNC_TOKEN: &str = r#"{"accessToken": "cached-token", "expiresAt": "2099-01-01T00:00:00Z"}"#;
+
+fn sync_fixture() -> Fixture {
+    let f = Fixture::new();
+    fs::write(f.0.join("config"), SYNC_CONFIG).unwrap();
+    write_sso_cache(&f, SESSION_CACHE, SYNC_TOKEN);
+    f
+}
+
+fn sync(f: &Fixture, args: &[&str]) -> Output {
+    f.command(&[&["sync"], args].concat())
+        .env(
+            "SSO_ACCOUNTS",
+            "111111111111\tProd\n222222222222\tDev Team\n333333333333\tDev-Team!\n",
+        )
+        .env(
+            "SSO_ROLES",
+            "111111111111\tAdmin\n111111111111\tReadOnly\n222222222222\tAdmin\n333333333333\tAdmin",
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn config(f: &Fixture) -> String {
+    fs::read_to_string(f.0.join("config")).unwrap()
+}
+
+#[test]
+fn sync_dry_run_prints_profiles_without_writing_or_leaking_the_token() {
+    let f = sync_fixture();
+    let output = sync(&f, &["--dry-run"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("# >>> tora aws sync abc >>>\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("# <<< tora aws sync abc <<<\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(
+        "\n[profile Dev-Team-222222222222-Admin]\nsso_session = abc\nsso_account_id = 222222222222\nsso_role_name = Admin\nregion = us-east-1\n"
+    ));
+    assert!(stdout.contains("[profile Dev-Team-333333333333-Admin]"));
+    assert!(stdout.contains("[profile Prod-ReadOnly]"));
+    // A hand-written profile with the same name is never generated.
+    assert!(!stdout.contains("[profile Prod-Admin]"));
+    assert!(stderr.contains("Skipped (already defined outside tora's managed block): Prod-Admin"));
+    assert_eq!(config(&f), SYNC_CONFIG);
+    // The token goes through a private input file, not the command line.
+    assert!(!f.calls().contains("cached-token"));
+    assert!(
+        f.calls()
+            .contains("list-accounts\n--region\nus-east-1\n--cli-input-json\n")
+    );
+    let input = fs::read_to_string(f.0.join("sso-input")).unwrap();
+    assert!(input.contains(r#""accountId": "333333333333""#));
+    assert!(!f.calls().contains("login"));
+}
+
+#[test]
+fn sync_writes_only_the_managed_block_and_is_idempotent() {
+    let f = sync_fixture();
+    fs::set_permissions(f.0.join("config"), fs::Permissions::from_mode(0o640)).unwrap();
+    let output = sync(&f, &["--yes", "--region", "ap-northeast-1"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("+ [profile Prod-ReadOnly]"), "{stderr}");
+    let written = config(&f);
+    assert!(written.starts_with(SYNC_CONFIG));
+    assert!(written.contains("sso_role_name = ReadOnly\nregion = ap-northeast-1\n"));
+    assert!(written.ends_with("# <<< tora aws sync abc <<<\n"));
+    assert_eq!(
+        fs::metadata(f.0.join("config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+
+    let output = sync(&f, &["--yes", "--region", "ap-northeast-1"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already up to date"));
+    assert_eq!(config(&f), written);
+
+    // Hand edits outside the block survive; removed accounts disappear from it.
+    let edited = written.replace("# my settings", "# my edited settings");
+    fs::write(f.0.join("config"), &edited).unwrap();
+    let output = f
+        .command(&["sync", "--yes", "--region", "ap-northeast-1"])
+        .env("SSO_ACCOUNTS", "111111111111\tProd\n")
+        .env("SSO_ROLES", "111111111111\tReadOnly")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("- [profile Dev-Team-222222222222-Admin]"),
+        "{stderr}"
+    );
+    let updated = config(&f);
+    assert!(updated.starts_with("# my edited settings\n"));
+    assert!(updated.contains("[profile Prod-ReadOnly]"));
+    assert!(!updated.contains("Dev-Team"));
+}
+
+#[test]
+fn sync_requires_confirmation_before_any_aws_call() {
+    let f = sync_fixture();
+    let output = sync(&f, &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+    assert_eq!(f.calls(), "");
+    assert_eq!(config(&f), SYNC_CONFIG);
+    assert!(
+        !f.command(&["sync", "--dry-run", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn sync_logs_in_to_the_sso_session_when_the_token_is_missing() {
+    let f = Fixture::new();
+    fs::write(f.0.join("config"), SYNC_CONFIG).unwrap();
+    let cache = f.0.join(".aws/sso/cache");
+    fs::create_dir_all(&cache).unwrap();
+    let output = f
+        .command(&["sync", "--dry-run", "--no-browser"])
+        .env("PROFILES", "")
+        .env("AWS_PROFILE", "broken")
+        .env("LOGIN_CACHE", cache.join(format!("{SESSION_CACHE}.json")))
+        .env("LOGIN_CACHE_CONTENT", SYNC_TOKEN)
+        .env("SSO_ACCOUNTS", "111111111111\tProd\n")
+        .env("SSO_ROLES", "111111111111\tReadOnly")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // Login output stays off stdout, which carries only the generated block.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("# >>> tora aws sync abc >>>"),
+        "{stdout}"
+    );
+    assert!(
+        f.calls()
+            .starts_with("sso\nlogin\n--sso-session\nabc\n--no-browser\n")
+    );
+    assert!(stderr.contains("login profile: \n"), "{stderr}");
+
+    // An expired cache also logs in; a failed login stops before listing.
+    write_sso_cache(
+        &f,
+        SESSION_CACHE,
+        r#"{"accessToken": "cached-token", "expiresAt": "2000-01-01T00:00:00Z"}"#,
+    );
+    fs::remove_file(f.0.join("calls")).unwrap();
+    let output = f
+        .command(&["sync", "--dry-run"])
+        .env("LOGIN_STATUS", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("aws sso login failed"));
+    assert!(!f.calls().contains("list-accounts"));
+}
+
+#[test]
+fn sync_retries_once_after_login_when_the_token_is_rejected() {
+    let f = sync_fixture();
+    let output = f
+        .command(&["sync", "--dry-run"])
+        .env("SSO_TOKEN", "fresh-token")
+        .env(
+            "LOGIN_CACHE",
+            f.0.join(format!(".aws/sso/cache/{SESSION_CACHE}.json")),
+        )
+        .env(
+            "LOGIN_CACHE_CONTENT",
+            r#"{"accessToken": "fresh-token", "expiresAt": "2099-01-01T00:00:00Z"}"#,
+        )
+        .env("SSO_ACCOUNTS", "111111111111\tProd\n")
+        .env("SSO_ROLES", "111111111111\tReadOnly")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(f.calls().matches("list-accounts").count(), 2);
+    assert_eq!(f.calls().matches("login").count(), 1);
+}
+
+#[test]
+fn sync_explains_missing_unknown_or_ambiguous_sso_sessions() {
+    let f = Fixture::new();
+    let output = f.command(&["sync", "--dry-run"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("aws configure sso-session"));
+
+    fs::write(
+        f.0.join("config"),
+        "[sso-session abc]\nsso_region = us-east-1\n[sso-session other]\nsso_region = us-east-1\n",
+    )
+    .unwrap();
+    let output = f
+        .command(&["sync", "--dry-run"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("multiple sso-sessions found (abc, other)"),
+        "{stderr}"
+    );
+    let output = f
+        .command(&["sync", "--dry-run", "--sso-session", "missing"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("\"missing\" not found"));
+    assert_eq!(f.calls(), "");
+}
+
+#[test]
+fn sync_refuses_damaged_markers() {
+    let f = sync_fixture();
+    let damaged = format!("{SYNC_CONFIG}# >>> tora aws sync abc >>>\n");
+    fs::write(f.0.join("config"), &damaged).unwrap();
+    let output = sync(&f, &["--yes"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("markers"));
+    assert_eq!(config(&f), damaged);
+    assert_eq!(f.calls(), "");
+}
+
+#[test]
+fn sync_skips_names_defined_anywhere_outside_its_block() {
+    let f = sync_fixture();
+    let other_block =
+        "# >>> tora aws sync other >>>\n[profile Prod-ReadOnly]\n# <<< tora aws sync other <<<\n";
+    let text = SYNC_CONFIG.replace("[profile Prod-Admin]", "[profile Prod-Admin] # mine")
+        + "[profile \"Dev-Team-222222222222-Admin\"]\n"
+        + other_block;
+    fs::write(f.0.join("config"), &text).unwrap();
+    fs::write(f.0.join("credentials"), "[Dev-Team-333333333333-Admin]\n").unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(
+        "Skipped (already defined outside tora's managed block): Dev-Team-222222222222-Admin, Dev-Team-333333333333-Admin, Prod-Admin, Prod-ReadOnly"
+    ), "{stderr}");
+    let written = config(&f);
+    // Nothing to generate: the block holds only its header, and the other block is untouched.
+    assert!(written.starts_with(&text));
+    assert!(!written[text.len()..].contains("[profile"));
+}
+
+#[test]
+fn sync_failures_leave_the_config_unchanged_and_log_in_at_most_once() {
+    let f = sync_fixture();
+    let output = f
+        .command(&["sync", "--yes"])
+        .env("SSO_TOKEN", "never-valid")
+        .env("SSO_ACCOUNTS", "111111111111\tProd\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("aws sso list-accounts failed"), "{stderr}");
+    assert_eq!(f.calls().matches("login").count(), 1);
+    assert_eq!(config(&f), SYNC_CONFIG);
+    // The private request directory keeps no token files.
+    assert_eq!(fs::read_dir(f.0.join("tora/tmp")).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(f.0.join("tora/tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn sync_keeps_crlf_files_in_crlf() {
+    let f = sync_fixture();
+    let crlf = SYNC_CONFIG.replace('\n', "\r\n");
+    fs::write(f.0.join("config"), &crlf).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("+ [profile Prod-ReadOnly]"), "{stderr}");
+    let written = config(&f);
+    // Everything outside the block is byte-for-byte unchanged and the block uses CRLF.
+    assert!(written.starts_with(&crlf));
+    assert!(written[crlf.len()..].starts_with("# >>> tora aws sync abc >>>\r\n"));
+    assert!(written.ends_with("# <<< tora aws sync abc <<<\r\n"));
+    assert!(!written.replace("\r\n", "").contains('\n'));
+    let output = sync(&f, &["--yes"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already up to date"));
+
+    // A file converted to CRLF after the first sync is still recognized.
+    let f = sync_fixture();
+    assert!(sync(&f, &["--yes"]).status.success());
+    let converted = config(&f).replace('\n', "\r\n");
+    fs::write(f.0.join("config"), &converted).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("already up to date"), "{stderr}");
+    assert_eq!(config(&f), converted);
+
+    // Converting back to LF inside a CRLF file rewrites only the block's line endings.
+    let mixed = converted.replacen(
+        "# >>> tora aws sync abc >>>\r\n",
+        "# >>> tora aws sync abc >>>\n",
+        1,
+    );
+    fs::write(f.0.join("config"), &mixed).unwrap();
+    let output = sync(&f, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only line endings change"), "{stderr}");
+    assert_eq!(config(&f), converted);
 }
