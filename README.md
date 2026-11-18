@@ -36,6 +36,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 | 必要なときだけログインして実行する | `tora aws exec --login dev -- terraform plan` | 認証を確認し、期限切れなら SSO ログインしてから実行 |
 | SSO のプロファイルをまとめて作る | `tora aws sync` | アクセスできる全アカウント・ロールのプロファイルを差分確認後に生成 |
 | EC2 にログインする | `tora aws ssm` | インスタンスを選んで Session Manager で接続（前回の接続先を表示） |
+| RDS などにローカルから接続する | `tora aws tunnel dev` | 踏み台経由でローカルポートを転送（前回の転送先を再利用） |
 | 環境の問題を調べる | `tora doctor` | インストール・補完・AWS 認証・SSO 期限を診断 |
 | AWS の実際の接続先を確認する | `tora aws whoami` | アカウント・ARN・リージョンを表示 |
 | SSO セッションを終了する | `tora aws logout` | 全プロファイルの SSO キャッシュをログアウト |
@@ -54,6 +55,7 @@ AWS プロファイルの選択から SSO ログイン、認証用シェルの�
 - [SSO のアカウントからプロファイルを生成する](#sso-のアカウントからプロファイルを生成する)
 - [プロファイルを指定してコマンドを実行](#プロファイルを指定してコマンドを実行)
 - [Session Manager でインスタンスに接続](#session-manager-でインスタンスに接続)
+- [踏み台経由でポートを転送](#踏み台経由でポートを転送)
 - [開発](#開発)
 - [リリース](#リリース)
 
@@ -293,7 +295,7 @@ SSO の認証確認またはログイン成功時と `aws exec` の実行直前�
 `$TORA_HOME/aws-profile-history`（既定は `~/.tora/aws-profile-history`）へ保存します。
 直近20件を保持し、選択メニューでは最近使った設定済みプロファイルを上に表示します。
 直前に使ったプロファイルには `(last used)`、それ以前に使ったものには `(recent)` を付けます。
-履歴は SSO・exec・ssm で共通です。設定から削除した名前は一覧に追加しません。
+履歴は SSO・exec・ssm・tunnel で共通です。設定から削除した名前は一覧に追加しません。
 `aws profiles` の出力順は変わりません。履歴に認証情報は保存しません。
 履歴の読み取りに失敗した場合は通常の一覧順で表示し、保存に失敗しても処理を続けます。
 履歴ファイルを削除すると履歴をリセットできます。
@@ -539,6 +541,47 @@ AWS CLI v2 に加えて [Session Manager プラグイン](https://docs.aws.amazo
 接続時は tora のプロセスを `aws ssm start-session --target ...` に置き換えるため、
 終了コードやシグナルもそのまま伝わります。番号選択で標準入力から読み込んだ残りの入力は
 セッションに渡らないため、セッションへ入力を流し込む場合は `-t` で接続先を指定してください。
+
+## 踏み台経由でポートを転送
+
+```sh
+tora aws tunnel dev -t i-0123456789abcdef0 -r mydb.xxxx.ap-northeast-1.rds.amazonaws.com:5432
+tora aws tunnel dev                       # 2回目以降: 履歴から転送先を選ぶだけ
+tora aws tunnel dev -r db.internal:3306 -l 13306   # ローカルポートを指定
+```
+
+```text
+? Port forwarding (Esc/q to cancel) ›
+❯ mydb.xxxx.ap-northeast-1.rds.amazonaws.com:5432  via i-0123456789abcdef0  (last used)
+  cache.internal:6379  via i-0123456789abcdef0  (recent)
+  Enter a new remote host
+Forwarding localhost:5432 -> mydb.xxxx.ap-northeast-1.rds.amazonaws.com:5432 via i-0123456789abcdef0 with profile "dev".
+Connect to localhost:5432 while the session runs; press Ctrl+C to stop.
+```
+
+Session Manager のポート転送（`AWS-StartPortForwardingSessionToRemoteHost`）で、
+踏み台インスタンスから到達できるホスト（RDS など）へローカルポートを転送します。
+プロファイルの決定・認証・Session Manager プラグインの確認・インスタンスの選択は
+`tora aws ssm` と同じです（`--select` / `--no-browser` / `--use-device-code` も同様）。
+
+- `-r` / `--remote HOST:PORT`: 転送先。ホスト名か IPv4 アドレスとポート（1-65535）を指定します。
+  `-` で始まる値、空白・制御文字などを含む値は AWS を呼ぶ前に拒否します。
+- `-t` / `--target ID`: 踏み台インスタンス。省略時は、同じプロファイルで同じ `--remote` を
+  使ったことがあれば直前の踏み台を使い（その旨を表示）、なければインスタンス一覧から選びます。
+- `-l` / `--local PORT`: ローカルポート。省略時はリモートと同じポートを使い、
+  使用中なら空いているポートを選びます。指定したポートが使用中ならログイン前に停止します。
+  どちらの場合も接続先の `localhost:<port>` を表示します。
+
+`--remote` を省略すると、そのプロファイルで使った転送先（踏み台と接続先の組）を新しい順に表示し、
+選ぶだけで前回と同じ転送を開始します。「Enter a new remote host」または履歴がない場合は
+接続先を入力し、続けてインスタンスを選びます。`-t` を指定した場合は、そのインスタンス経由の履歴だけを表示します。
+標準入力がターミナルでない場合は番号選択（`0` で新規入力、`q` でキャンセル）になります。
+
+転送先は `$TORA_HOME/aws-tunnel-history` に、プロファイルごとに直近20件まで保存します。
+使った踏み台は `tora aws ssm` の接続先履歴にも記録します。履歴は転送を開始する直前に保存し、
+選択をキャンセルした場合は保存しません。
+接続時は tora のプロセスを `aws ssm start-session` に置き換えるため、Ctrl+C で転送を終了でき、
+終了コードもそのまま伝わります。
 
 ## 開発
 
