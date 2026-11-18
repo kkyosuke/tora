@@ -70,10 +70,18 @@ pub(super) fn run(
 
     let tunnel = match (target, remote) {
         (Some(target), Some(remote)) => Tunnel { target, remote },
-        (None, Some(remote)) => Tunnel {
-            target: ssm::select_target(&profile, settings)?,
-            remote,
-        },
+        (None, Some(remote)) => {
+            let target = match recent_target(&profile, &remote) {
+                Some(target) => {
+                    eprintln!(
+                        "Using {target} from history for {remote} (pass -t to choose another instance)."
+                    );
+                    target
+                }
+                None => ssm::select_target(&profile, settings)?,
+            };
+            Tunnel { target, remote }
+        }
         (target, None) => choose(&profile, target, settings)?,
     };
     let local = local_port(local, tunnel.remote.port)?;
@@ -96,6 +104,16 @@ pub(super) fn run(
         settings,
         &["--document-name", DOCUMENT, "--parameters", &parameters],
     )
+}
+
+/// The instance most recently used with this profile to reach `remote`.
+fn recent_target(profile: &str, remote: &Remote) -> Option<String> {
+    history::TUNNELS
+        .for_profile(profile)
+        .iter()
+        .filter_map(|entry| parse_entry(entry))
+        .find(|tunnel| tunnel.remote == *remote)
+        .map(|tunnel| tunnel.target)
 }
 
 /// Picks a recent destination for the profile, or asks for a new remote host and then an

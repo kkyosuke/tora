@@ -1162,6 +1162,41 @@ fn tunnel_new_remote_prompts_then_selects_instance() {
 }
 
 #[test]
+fn tunnel_remote_alone_reuses_its_last_instance() {
+    let f = Fixture::new();
+    let port = free_port();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-tunnel-history"),
+        format!(
+            "dev\ti-0aaa\tother:{port}\nprod\ti-0ccc\tdb:{port}\n\
+             dev\ti-0bbb\tdb:{port}\ndev\ti-0ddd\tdb:{port}\n"
+        ),
+    )
+    .unwrap();
+    let remote = format!("db:{port}");
+    let output = f
+        .command(&["tunnel", "dev", "-r", &remote])
+        .env("CHECK_STATUS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.contains(&format!("Using i-0bbb from history for db:{port}")),
+        "{err}"
+    );
+    assert_eq!(ssm_calls(&f), ["sts", "start-session"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0bbb:"));
+
+    // A remote not used with this profile still lists instances.
+    let output = f.input(&["tunnel", "dev", "-r", "new-db:5432"], "q\n");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Select instance:"));
+}
+
+#[test]
 fn tunnel_target_filters_history() {
     let f = Fixture::new();
     fs::create_dir(f.0.join("tora")).unwrap();
