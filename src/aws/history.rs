@@ -23,7 +23,7 @@ pub(super) const PROFILES: Store = Store {
 };
 
 /// Session Manager targets per profile, stored as `<profile>\t<target>`.
-/// [`INSTANCES_PER_PROFILE`] entries are kept for each profile.
+/// [`PER_PROFILE`] entries are kept for each profile.
 pub(super) const INSTANCES: Store = Store {
     file: "aws-ssm-history",
     label: "Session Manager",
@@ -31,15 +31,28 @@ pub(super) const INSTANCES: Store = Store {
     // dropped only if the file would exceed MAX_BYTES.
     limit: usize::MAX,
     valid: |entry| {
-        split_instance(entry).is_some_and(|(profile, target)| {
+        split_profile(entry).is_some_and(|(profile, target)| {
             super::validate_profile(profile).is_ok() && super::ssm::valid_target(target)
         })
     },
 };
-pub(super) const INSTANCES_PER_PROFILE: usize = 20;
 
-/// Splits a Session Manager history entry into `(profile, target)`.
-pub(super) fn split_instance(entry: &str) -> Option<(&str, &str)> {
+/// Port forwarding destinations per profile, stored as `<profile>\t<target>\t<host>:<port>`.
+/// [`PER_PROFILE`] entries are kept for each profile.
+pub(super) const TUNNELS: Store = Store {
+    file: "aws-tunnel-history",
+    label: "port forwarding",
+    limit: usize::MAX,
+    valid: |entry| {
+        split_profile(entry).is_some_and(|(profile, value)| {
+            super::validate_profile(profile).is_ok() && super::tunnel::parse_entry(value).is_some()
+        })
+    },
+};
+pub(super) const PER_PROFILE: usize = 20;
+
+/// Splits a per-profile history entry into `(profile, value)`.
+fn split_profile(entry: &str) -> Option<(&str, &str)> {
     entry.split_once('\t')
 }
 
@@ -122,16 +135,27 @@ impl Store {
     pub(super) fn remember(&self, entry: &str) {
         self.remember_with(entry, |_, _| true);
     }
-}
 
-/// Saves a target and keeps at most [`INSTANCES_PER_PROFILE`] entries for each profile,
-/// so frequent use of one profile does not push out another profile's history.
-pub(super) fn remember_instance(profile: &str, target: &str) {
-    let key = |entry: &str| split_instance(entry).map(|(p, _)| p.to_owned());
-    INSTANCES.remember_with(&format!("{profile}\t{target}"), |kept, entry| {
-        let profile = key(entry);
-        kept.iter().filter(|e| key(e) == profile).count() < INSTANCES_PER_PROFILE
-    });
+    /// Values saved for `profile`, most recent first.
+    pub(super) fn for_profile(&self, profile: &str) -> Vec<String> {
+        self.recent()
+            .into_iter()
+            .filter_map(|entry| {
+                let (p, value) = split_profile(&entry)?;
+                (p == profile).then(|| value.to_owned())
+            })
+            .collect()
+    }
+
+    /// Saves a value for `profile` and keeps at most [`PER_PROFILE`] entries for each
+    /// profile, so frequent use of one profile does not push out another profile's history.
+    pub(super) fn remember_for(&self, profile: &str, value: &str) {
+        let key = |entry: &str| split_profile(entry).map(|(p, _)| p.to_owned());
+        self.remember_with(&format!("{profile}\t{value}"), |kept, entry| {
+            let profile = key(entry);
+            kept.iter().filter(|e| key(e) == profile).count() < PER_PROFILE
+        });
+    }
 }
 
 /// Moves items found in `recent` to the front, most recent first. The stable sort keeps

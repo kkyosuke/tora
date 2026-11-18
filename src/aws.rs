@@ -2,6 +2,7 @@ mod history;
 mod settings;
 mod ssm;
 mod status;
+mod tunnel;
 
 use settings::Settings;
 
@@ -113,6 +114,31 @@ pub fn run(command: AwsCommands) -> io::Result<()> {
                 profile.or(settings.profile.clone())
             };
             ssm::run(profile, target, &settings, no_browser, use_device_code)
+        }
+        AwsCommands::Tunnel {
+            profile,
+            target,
+            remote,
+            local,
+            select,
+            no_browser,
+            use_device_code,
+        } => {
+            ssm::check_profile_argument(profile.as_deref())?;
+            let profile = if select {
+                None
+            } else {
+                profile.or(settings.profile.clone())
+            };
+            tunnel::run(
+                profile,
+                target,
+                remote,
+                local,
+                &settings,
+                no_browser,
+                use_device_code,
+            )
         }
         AwsCommands::Status { profile } => {
             let profile = resolve_profile(profile.or(settings.profile.clone()), &settings)?;

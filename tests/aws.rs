@@ -1007,6 +1007,315 @@ fn status_resolves_profile_like_sso() {
     assert_eq!(f.calls(), "configure\nlist-profiles\n");
 }
 
+/// A port free on all loopback and wildcard addresses, as `tora aws tunnel` requires.
+fn free_port() -> u16 {
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let free = ["0.0.0.0", "[::1]", "[::]"].iter().all(|host| {
+            match std::net::TcpListener::bind(format!("{host}:{port}")) {
+                Ok(_) => true,
+                // Hosts without IPv6 cannot bind IPv6 addresses at all.
+                Err(error) => {
+                    host.starts_with('[') && error.kind() != std::io::ErrorKind::AddrInUse
+                }
+            }
+        });
+        if free {
+            return port;
+        }
+    }
+}
+
+fn tunnel_parameters(host: &str, port: u16, local: u16) -> String {
+    format!(
+        "AWS-StartPortForwardingSessionToRemoteHost\n--parameters\n\
+         {{\"host\":[\"{host}\"],\"portNumber\":[\"{port}\"],\"localPortNumber\":[\"{local}\"]}}\n"
+    )
+}
+
+#[test]
+fn tunnel_forwards_explicit_destination_and_saves_history() {
+    let f = Fixture::new();
+    let local = free_port();
+    let local_arg = local.to_string();
+    let output = f
+        .command(&[
+            "tunnel",
+            "dev",
+            "-t",
+            "i-0aaa",
+            "--remote",
+            "db.example.com:5432",
+            "--local",
+            &local_arg,
+            "--no-browser",
+        ])
+        .env("SESSION_STATUS", "3")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{err}");
+    assert!(
+        err.contains(&format!(
+            "Forwarding localhost:{local} -> db.example.com:5432 via i-0aaa"
+        )),
+        "{err}"
+    );
+    assert_eq!(ssm_calls(&f), ["sts", "login", "start-session"]);
+    assert!(f.calls().contains("--no-browser\n"));
+    assert!(
+        f.calls()
+            .contains(&tunnel_parameters("db.example.com", 5432, local)),
+        "{}",
+        f.calls()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "session:dev:i-0aaa:unset\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-tunnel-history")).unwrap(),
+        "dev\ti-0aaa\tdb.example.com:5432\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-ssm-history")).unwrap(),
+        "dev\ti-0aaa\n"
+    );
+}
+
+#[test]
+fn tunnel_reuses_history_with_only_a_profile() {
+    let f = Fixture::new();
+    let port = free_port();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-tunnel-history"),
+        format!("dev\tmi-0ccc\tcache:{port}\nother\ti-0bbb\tx:1\ndev\ti-0aaa\tdb:5432\n"),
+    )
+    .unwrap();
+    let output = f
+        .command(&["tunnel", "dev"])
+        .env("CHECK_STATUS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(b"1\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.contains(&format!("  1. cache:{port}  via mi-0ccc  (last used)\n")),
+        "{err}"
+    );
+    assert!(
+        err.contains("  2. db:5432  via i-0aaa  (recent)\n"),
+        "{err}"
+    );
+    assert!(!err.contains("x:1"), "{err}");
+    // The remote port is reused locally when it is free.
+    assert!(err.contains(&format!("localhost:{port} ->")), "{err}");
+    assert_eq!(ssm_calls(&f), ["sts", "start-session"]);
+    assert!(f.calls().contains(&tunnel_parameters("cache", port, port)));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:mi-0ccc:"));
+}
+
+#[test]
+fn tunnel_new_remote_prompts_then_selects_instance() {
+    let f = Fixture::new();
+    let port = free_port();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-tunnel-history"),
+        "dev\ti-0aaa\tdb:5432\n",
+    )
+    .unwrap();
+    let input = format!("0\n-db:1\nnew-db:{port}\n/web\n1\n");
+    let output = f.input(&["tunnel", "dev"], &input);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(err.contains("invalid remote host"), "{err}");
+    assert!(err.contains("Select instance:"), "{err}");
+    assert!(f.calls().contains(&tunnel_parameters("new-db", port, port)));
+    assert_eq!(
+        fs::read_to_string(f.0.join("tora/aws-tunnel-history")).unwrap(),
+        format!("dev\ti-0aaa\tnew-db:{port}\ndev\ti-0aaa\tdb:5432\n")
+    );
+
+    // Without history the remote host is asked for directly; --target skips the list.
+    let f = Fixture::new();
+    let output = f.input(&["tunnel", "dev", "-t", "i-0bbb"], &format!("db:{port}\n"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!f.calls().contains("describe-instance-information"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0bbb:"));
+}
+
+#[test]
+fn tunnel_remote_alone_reuses_its_last_instance() {
+    let f = Fixture::new();
+    let port = free_port();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-tunnel-history"),
+        format!(
+            "dev\ti-0aaa\tother:{port}\nprod\ti-0ccc\tdb:{port}\n\
+             dev\ti-0bbb\tdb:{port}\ndev\ti-0ddd\tdb:{port}\n"
+        ),
+    )
+    .unwrap();
+    let remote = format!("db:{port}");
+    let output = f
+        .command(&["tunnel", "dev", "-r", &remote])
+        .env("CHECK_STATUS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.contains(&format!("Using i-0bbb from history for db:{port}")),
+        "{err}"
+    );
+    assert_eq!(ssm_calls(&f), ["sts", "start-session"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("session:dev:i-0bbb:"));
+
+    // A remote not used with this profile still lists instances.
+    let output = f.input(&["tunnel", "dev", "-r", "new-db:5432"], "q\n");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Select instance:"));
+}
+
+#[test]
+fn tunnel_target_filters_history() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("tora")).unwrap();
+    fs::write(
+        f.0.join("tora/aws-tunnel-history"),
+        "dev\ti-0aaa\ta:5432\ndev\ti-0bbb\tb:5432\n",
+    )
+    .unwrap();
+    let output = f.input(&["tunnel", "dev", "-t", "i-0bbb"], "q\n");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(err.contains("  1. b:5432  via i-0bbb  (recent)\n"), "{err}");
+    assert!(!err.contains("a:5432"), "{err}");
+}
+
+#[test]
+fn tunnel_uses_a_free_local_port_when_remote_port_is_busy() {
+    let f = Fixture::new();
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = busy.local_addr().unwrap().port();
+    let remote = format!("db:{port}");
+    let output = f
+        .command(&["tunnel", "dev", "-t", "i-0aaa", "-r", &remote])
+        .env("CHECK_STATUS", "0")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(
+        err.contains(&format!(
+            "localhost:{port} is already in use; using localhost:"
+        )),
+        "{err}"
+    );
+    assert!(
+        !f.calls()
+            .contains(&format!("\"localPortNumber\":[\"{port}\"]"))
+    );
+
+    // An explicit busy port fails before any AWS call.
+    let f = Fixture::new();
+    let output = f
+        .command(&[
+            "tunnel",
+            "dev",
+            "-t",
+            "i-0aaa",
+            "-r",
+            &remote,
+            "-l",
+            &port.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn tunnel_rejects_invalid_input_before_aws() {
+    let f = Fixture::new();
+    for (args, error) in [
+        (&["--remote=-db:1"][..], "invalid remote host"),
+        (&["--remote=db"], "expected HOST:PORT"),
+        (&["--remote=db:0"], "invalid remote port"),
+        (&["--remote=db:70000"], "invalid remote port"),
+        (&["--remote=db\u{1b}[2J:1"], "invalid remote host"),
+        (
+            &["--target=--profile", "-r", "db:1"],
+            "invalid Session Manager target",
+        ),
+        (&["--local=0", "-r", "db:1"], "invalid value"),
+        (&["--local=70000", "-r", "db:1"], "invalid value"),
+    ] {
+        let mut command = f.command(&["tunnel", "dev"]);
+        let output = command.args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains(error), "{args:?}: {err}");
+        assert!(!err.contains('\u{1b}'), "{err}");
+    }
+    let output = f
+        .command(&["tunnel", "i-0123456789abcdef0", "-r", "db:1"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use --target i-0123456789abcdef0"));
+    fs::remove_file(f.0.join("session-manager-plugin")).unwrap();
+    let output = f.command(&["tunnel", "dev"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("session-manager-plugin not found"));
+    assert!(f.calls().is_empty());
+}
+
+#[test]
+fn tunnel_cancel_or_eof_saves_nothing() {
+    let f = Fixture::new();
+    for input in ["", "q\n"] {
+        let output = f
+            .command(&["tunnel", "dev"])
+            .env("CHECK_STATUS", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                // EOF at the remote prompt, or a valid remote then cancel at the instance menu.
+                let input = if input.is_empty() { "" } else { "db:1\nq\n" };
+                child.stdin.take().unwrap().write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!f.calls().contains("start-session"));
+        assert!(!f.0.join("tora/aws-tunnel-history").exists());
+        assert!(!f.0.join("tora/aws-ssm-history").exists());
+        assert!(!f.0.join("tora/aws-profile-history").exists());
+    }
+}
+
 fn ssm_calls(f: &Fixture) -> Vec<String> {
     f.calls()
         .lines()
